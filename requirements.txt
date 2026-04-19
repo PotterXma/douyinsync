@@ -1,0 +1,8 @@
+pystray
+Pillow
+requests
+apscheduler
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+httplib2

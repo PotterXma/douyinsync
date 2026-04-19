@@ -1,0 +1,174 @@
+import requests
+import json
+from urllib.parse import urlparse, urlencode, quote
+from modules.logger import logger
+from modules.config_manager import config
+from modules.abogus import ABogus, USERAGENT
+
+class DouyinFetcher:
+    def __init__(self):
+        # We spoof a standard Windows browser to bypass basic generic WAF
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.douyin.com/",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate"
+        }
+
+    def _get_cookie_header(self):
+        cookie = str(config.get("douyin_cookie", "")).strip()
+        if cookie:
+            return {"Cookie": cookie}
+        return {}
+
+    def fetch_user_posts(self, user_url: str) -> list:
+        """
+        Parses profile to get videos. 
+        Robust HTTP interface mapping Douyin API endpoint.
+        """
+        logger.info(f"DouyinFetcher: Initiating scrape for URL -> {user_url}")
+        
+        current_headers = self.headers.copy()
+        current_headers.update(self._get_cookie_header())
+        
+        sec_user_id = self._extract_sec_user_id(user_url)
+        if not sec_user_id:
+            logger.error(f"DouyinFetcher: Could not extract valid sec_user_id from {user_url}")
+            return []
+            
+        # Use exact endpoint mapping
+        query_dict = {
+            "device_platform": "webapp",
+            "aid": "6383",
+            "channel": "channel_pc_web",
+            "update_version_code": "170400",
+            "pc_client_type": "1",
+            "version_code": "290100",
+            "version_name": "29.1.0",
+            "cookie_enabled": "true",
+            "screen_width": "1536",
+            "screen_height": "864",
+            "browser_language": "zh-CN",
+            "browser_platform": "Win32",
+            "browser_name": "Chrome",
+            "browser_version": "122.0.0.0",
+            "browser_online": "true",
+            "engine_name": "Blink",
+            "engine_version": "122.0.0.0",
+            "os_name": "Windows",
+            "os_version": "10",
+            "cpu_core_num": "16",
+            "device_memory": "8",
+            "platform": "PC",
+            "downlink": "10",
+            "effective_type": "4g",
+            "round_trip_time": "200",
+            "sec_user_id": sec_user_id,
+            "count": 10,
+            "max_cursor": 0,
+            "locate_query": "false",
+            "show_live_replay_strategy": "1",
+            "need_time_list": "1",
+            "time_list_query": "0",
+            "whale_cut_token": "",
+            "cut_version": "1",
+            "publish_video_strategy_type": "2",
+        }
+        
+        # Ensure our header uses EXACTLY the user agent that ABogus signs for
+        current_headers["User-Agent"] = USERAGENT
+        current_headers["Referer"] = "https://www.douyin.com/"
+        
+        # Must specifically be urlencode with quote_via=quote for identical hashing
+        query_str = urlencode(query_dict, quote_via=quote)
+        
+        # Feed exactly into JoeanAmier ABogus reverse engineered struct
+        abogus_str = ABogus(user_agent=USERAGENT).get_value(query_str, method="GET")
+        
+        # Concat fully qualified signature
+        api_url = f"https://www.douyin.com/aweme/v1/web/aweme/post/?{query_str}&a_bogus={abogus_str}"
+        
+        try:
+            # We enforce direct domestic connection (No Proxy) to hit Douyin smoothly usually.
+            response = requests.get(api_url, headers=current_headers, timeout=15.0)
+            response.raise_for_status()
+            data = response.json()
+            
+            return self._parse_video_list(data)
+        except requests.RequestException as e:
+            logger.error(f"DouyinFetcher: Network error during fetch. {e}")
+            return []
+        except Exception as e:
+            logger.error(f"DouyinFetcher: Exception during fetch payload parsing: {e}")
+            return []
+
+    def _extract_sec_user_id(self, url: str) -> str:
+        """Extracts the unique sec_user_id from standard profile sharing URLs."""
+        try:
+            path = urlparse(url).path
+            parts = path.strip('/').split('/')
+            if "user" in parts:
+                idx = parts.index("user")
+                if idx + 1 < len(parts):
+                    return parts[idx + 1]
+        except Exception as e:
+            logger.debug(f"Failed to URL-parse {url}: {e}")
+        return ""
+
+    def _parse_video_list(self, json_data: dict) -> list:
+        """Safely distills Douyin JSON into generic pipeline dict metadata."""
+        results = []
+        if not isinstance(json_data, dict):
+            logger.warning("DouyinFetcher: Invalid JSON payload root format.")
+            return results
+            
+        aweme_list = json_data.get("aweme_list", [])
+        if not aweme_list:
+            logger.warning("DouyinFetcher: Payload returned empty or null aweme_list. Likely blocked by Douyin WAF or Cookie expired.")
+            return results
+        
+        for item in aweme_list:
+            # Filter Layer: Discard Tuwen (Image posts) protecting downstream YouTube Uploader
+            if item.get("images") is not None or item.get("aweme_type") == 68:
+                logger.debug(f"DouyinFetcher: Filtering out unsupported Image-Post. ID: {item.get('aweme_id')}")
+                continue
+                
+            try:
+                douyin_id = item["aweme_id"]
+                title = item.get("desc", "")
+                
+                # Digging for primary MP4 (Highest Quality)
+                video_info = item.get("video", {})
+                bit_rate_list = video_info.get("bit_rate", [])
+                video_url = ""
+                if bit_rate_list:
+                    # Sort by bit_rate value descending to grab the highest quality
+                    bit_rate_list = sorted(bit_rate_list, key=lambda x: x.get("bit_rate", 0), reverse=True)
+                    best_play_addr = bit_rate_list[0].get("play_addr", {}).get("url_list", [])
+                    if best_play_addr:
+                        video_url = best_play_addr[0]
+                
+                # Fallback to base play_addr if bit_rate array is missing
+                if not video_url:
+                    play_addr = video_info.get("play_addr", {}).get("url_list", [])
+                    if not play_addr:
+                        continue
+                    video_url = play_addr[0]
+                
+                # Digging for WebP cover
+                cover_addr = video_info.get("cover", {}).get("url_list", [])
+                cover_url = cover_addr[0] if cover_addr else ""
+                
+                results.append({
+                    "douyin_id": str(douyin_id),
+                    "title": title[:300], # Soft fail-safe limit
+                    "description": title,
+                    "video_url": video_url,
+                    "cover_url": cover_url
+                })
+            except KeyError as e:
+                logger.debug(f"DouyinFetcher: Skipped item missing fundamental keys {e}")
+                continue
+                
+        logger.info(f"DouyinFetcher: Successfully processed {len(results)} valid video records.")
+        return results
