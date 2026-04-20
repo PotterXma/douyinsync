@@ -1,5 +1,6 @@
 import sys
 import json
+import threading
 from pathlib import Path
 from modules.logger import logger
 
@@ -17,6 +18,7 @@ class ConfigManager:
             cls._instance = super(ConfigManager, cls).__new__(cls)
             cls._instance.config_file = PROJECT_ROOT / "config.json"
             cls._instance._cache = {}
+            cls._instance._lock = threading.Lock()
             cls._instance.reload()
         return cls._instance
 
@@ -33,7 +35,8 @@ class ConfigManager:
         try:
             with open(self.config_file, "r", encoding="utf-8") as f:
                 new_data = json.load(f)
-            self._cache = new_data
+            with self._lock:
+                self._cache = new_data
             logger.info("Configuration loaded/reloaded successfully.")
             return True
         except json.JSONDecodeError as e:
@@ -45,7 +48,8 @@ class ConfigManager:
 
     def get(self, key: str, default=None):
         """Retrieves a configuration value with dictionary-like .get logic."""
-        return self._cache.get(key, default)
+        with self._lock:
+            return self._cache.get(key, default)
 
     def get_proxies(self) -> dict:
         """

@@ -68,6 +68,12 @@ class TrayController:
         self.is_monitoring = True
         self.icon.icon = create_image("running")
         self.icon.update_menu()
+        # Resume the APScheduler if it was paused
+        if self.coordinator and hasattr(self.coordinator, 'scheduler'):
+            try:
+                self.coordinator.scheduler.resume()
+            except Exception:
+                pass
         messagebox.showinfo("服务状态", "定时监控引擎已激活。后台将在设定时间拉取资源。")
 
     def action_stop_monitor(self, icon, item):
@@ -75,6 +81,12 @@ class TrayController:
         self.is_monitoring = False
         self.icon.icon = create_image("paused")
         self.icon.update_menu()
+        # Pause the APScheduler to actually stop scheduled jobs
+        if self.coordinator and hasattr(self.coordinator, 'scheduler'):
+            try:
+                self.coordinator.scheduler.pause()
+            except Exception:
+                pass
         messagebox.showinfo("服务状态", "定时监控引擎已暂停！")
 
     def action_open_settings(self, icon, item):

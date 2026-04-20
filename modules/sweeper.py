@@ -1,10 +1,16 @@
 import os
+import sys
 import time
 import shutil
 from pathlib import Path
 from modules.logger import logger
 
-DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "downloads"
+if getattr(sys, 'frozen', False):
+    PROJECT_ROOT = Path(sys.executable).parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
 
 class DiskSweeper:
     def __init__(self):

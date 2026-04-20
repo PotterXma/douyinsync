@@ -176,3 +176,42 @@ class DouyinFetcher:
                 
         logger.info(f"DouyinFetcher: Successfully processed {len(results)} valid video records.")
         return results
+
+    def refresh_video_url(self, douyin_id: str, accounts: list) -> dict:
+        """
+        Re-fetches the video list from the API and finds a matching video_id 
+        to obtain a fresh CDN URL with valid time-based tokens.
+        Searches up to 3 pages to handle accounts with many videos.
+        Returns dict with fresh video_url/cover_url or None if not found.
+        """
+        for account in accounts:
+            if isinstance(account, dict):
+                if not account.get("enable", True):
+                    continue
+                account_url = account.get("url", "")
+            else:
+                account_url = str(account)
+            
+            if not account_url:
+                continue
+            
+            try:
+                # Search up to 3 pages to find the video (may not be in the first 10/13 results)
+                cursor = 0
+                for _page in range(3):
+                    posts, next_cursor, has_more = self.fetch_user_posts(account_url, max_cursor=cursor)
+                    for post in posts:
+                        if post.get("douyin_id") == douyin_id:
+                            return {
+                                "video_url": post.get("video_url", ""),
+                                "cover_url": post.get("cover_url", "")
+                            }
+                    if not has_more or next_cursor == 0:
+                        break
+                    cursor = next_cursor
+            except Exception as e:
+                logger.warning(f"DouyinFetcher: Error refreshing URL for {douyin_id}: {e}")
+                continue
+        
+        return None
+

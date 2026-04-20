@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from modules.logger import logger
 from winrt.windows.media.ocr import OcrEngine
 from winrt.windows.graphics.imaging import BitmapDecoder
 from winrt.windows.storage import StorageFile
@@ -23,7 +24,7 @@ async def _recognize_text_async(image_path: str) -> str:
         result = await engine.recognize_async(software_bitmap)
         return result.text
     except Exception as e:
-        print(f"OCR Error: {e}")
+        logger.warning(f"OCR async recognition error: {e}")
         return ""
 
 def get_text_from_image(image_path: str) -> str:
@@ -58,5 +59,5 @@ def get_text_from_image(image_path: str) -> str:
             # Main thread fast path
             return asyncio.run(_recognize_text_async(image_path))
     except Exception as e:
-        print(f"Failed to run Windows Native OCR: {e}")
+        logger.warning(f"Failed to run Windows Native OCR: {e}")
         return ""

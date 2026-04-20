@@ -207,9 +207,19 @@ class YouTubeUploader:
                     retry_count = 0
                 except Exception as e:
                     # Catch all network-level drops (SSL EOF, connection reset, read timeout)
-                    err_str = str(e).lower()
-                    if "quota" in err_str or "forbidden" in err_str or "403" in err_str:
-                        raise # Do not retry Quota exceptions or hard API bans
+                    # F8: Use precise quota detection - check for HttpError with 403 + quotaExceeded reason
+                    is_quota_error = False
+                    try:
+                        from googleapiclient.errors import HttpError
+                        if isinstance(e, HttpError) and e.resp.status == 403:
+                            error_details = str(e.content).lower()
+                            if 'quotaexceeded' in error_details or 'usagelimits' in error_details:
+                                is_quota_error = True
+                    except ImportError:
+                        pass
+                    
+                    if is_quota_error or 'quotaexceeded' in str(e).lower():
+                        raise  # Let the outer except handle the hard circuit breaker
                     
                     retry_count += 1
                     logger.warning(f"YouTubeUploader: Chunk upload interrupted ({retry_count}/{max_chunk_retries}): {e}")
@@ -221,6 +231,7 @@ class YouTubeUploader:
                     sleep_time = min(60, 2 ** retry_count)
                     logger.info(f"YouTubeUploader: Sleeping for {sleep_time}s before resuming chunk upload...")
                     time.sleep(sleep_time)
+                    continue  # F12: explicitly continue the while loop
 
             yt_video_id = response.get('id')
             logger.info(f"YouTubeUploader: SUCCESS! Video broadcast complete. https://youtu.be/{yt_video_id}")
@@ -232,8 +243,18 @@ class YouTubeUploader:
             return yt_video_id
 
         except Exception as e:
-            # Trap 403 / Quota Exceeded and return specific signal for Epic 4.3 Circuit Breaker
-            if "quotaExceeded" in str(e) or "403" in str(e):
+            # Trap Quota Exceeded precisely via googleapiclient HttpError
+            is_quota = False
+            try:
+                from googleapiclient.errors import HttpError
+                if isinstance(e, HttpError) and e.resp.status == 403:
+                    error_details = str(e.content).lower()
+                    if 'quotaexceeded' in error_details or 'usagelimits' in error_details:
+                        is_quota = True
+            except ImportError:
+                pass
+            
+            if is_quota or 'quotaexceeded' in str(e).lower():
                 logger.critical(f"YouTubeUploader: CIRCUIT BREAKER TRIGGERED! API Quota globally exhausted: {e}")
                 return "QUOTA_EXCEEDED"
             logger.error(f"YouTubeUploader: Upload transmission crashed or severely rejected: {e}")

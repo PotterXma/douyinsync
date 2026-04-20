@@ -225,10 +225,22 @@ class Downloader:
                 with requests.get(url, headers=req_headers, stream=True, timeout=(10, 120)) as r:
                     r.raise_for_status()
                     
-                    # 206 Partial Content indicates Range header was accepted
+                    # 206 Partial Content: server accepted Range header, we can resume
                     if r.status_code == 206:
                         mode = "ab"
+                        # Parse total size from Content-Range: bytes X-Y/TOTAL
+                        content_range = r.headers.get('content-range', '')
+                        if '/' in content_range:
+                            try:
+                                total_size = int(content_range.split('/')[-1])
+                            except (ValueError, IndexError):
+                                total_size = downloaded + int(r.headers.get('content-length', 0))
+                        else:
+                            total_size = downloaded + int(r.headers.get('content-length', 0))
                     else:
+                        # Server returned 200: doesn't support Range -> delete any corrupt partial file first
+                        if dest_path.exists():
+                            dest_path.unlink()
                         mode = "wb"
                         downloaded = 0
                         total_size = int(r.headers.get('content-length', 0))

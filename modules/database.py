@@ -136,9 +136,35 @@ class VideoDAO:
         return results
 
     @staticmethod
+    def get_uploadable_videos(limit: int = 1) -> list:
+        """Retrieves videos that were downloaded but failed to upload (status='downloaded' or 'failed' with local paths).
+        Only returns videos with retry_count < 3 to prevent infinite retry loops."""
+        sql = """
+            SELECT douyin_id, title, description, video_url, cover_url, local_video_path, local_cover_path 
+            FROM videos 
+            WHERE ((status = 'downloaded') OR (status = 'failed' AND local_video_path IS NOT NULL AND local_video_path != ''))
+              AND retry_count < 3
+            ORDER BY updated_at ASC LIMIT ?
+        """
+        results = []
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            for row in cursor.execute(sql, (limit,)):
+                results.append({
+                    'douyin_id': row[0],
+                    'title': row[1],
+                    'description': row[2],
+                    'video_url': row[3],
+                    'cover_url': row[4],
+                    'local_video_path': row[5],
+                    'local_cover_path': row[6]
+                })
+        return results
+
+    @staticmethod
     def get_uploaded_today_count() -> int:
         """Counts how many videos successfully uploaded locally today."""
-        sql = "SELECT COUNT(*) FROM videos WHERE status = 'uploaded' AND date(updated_at, 'localtime') = date('now', 'localtime')"
+        sql = "SELECT COUNT(*) FROM videos WHERE status = 'uploaded' AND date(updated_at, 'localtime') = date(datetime('now'), 'localtime')"
         with db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(sql)
@@ -150,10 +176,16 @@ class VideoDAO:
         Self-Healing Mechanism (Story 4.4):
         Locates any rows left 'processing' upon shutdown, reverting them so they aren't totally lost.
         """
-        sql = """
+        sql_revert_processing = """
             UPDATE videos 
             SET status = 'pending', retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP 
-            WHERE status = 'processing' OR status = 'downloading' OR status = 'uploading'
+            WHERE status = 'processing' OR status = 'downloading'
+        """
+        # uploading = local file already exists, only upload failed -> revert to 'downloaded' not 'pending'
+        sql_revert_uploading = """
+            UPDATE videos
+            SET status = 'downloaded', retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'uploading'
         """
         sql_fail_loop = """
             UPDATE videos
@@ -162,9 +194,18 @@ class VideoDAO:
         """
         with db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql)
+            cursor.execute(sql_revert_processing)
             reverted = cursor.rowcount
+            cursor.execute(sql_revert_uploading)
+            reverted += cursor.rowcount
             # Apply infinite loop defense limit
             cursor.execute(sql_fail_loop)
             
             return reverted
+
+    @staticmethod
+    def update_fresh_urls(douyin_id: str, video_url: str, cover_url: str) -> None:
+        """Updates cached CDN URLs with fresh ones to prevent stale token 403 errors."""
+        sql = "UPDATE videos SET video_url = ?, cover_url = ?, updated_at = CURRENT_TIMESTAMP WHERE douyin_id = ?"
+        with db.get_connection() as conn:
+            conn.execute(sql, (video_url, cover_url, douyin_id))
