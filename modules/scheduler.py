@@ -129,15 +129,17 @@ class PipelineCoordinator:
             if uploaded_today >= daily_limit:
                 logger.info(f"PipelineCoordinator: Daily upload limit reached ({uploaded_today}/{daily_limit}). Upload paused until tomorrow.")
             else:
-                remaining_slots = daily_limit - uploaded_today
                 max_per_cycle = config.get("max_videos_per_run", 1)
-                cycle_slots_left = min(remaining_slots, max_per_cycle)
+                # slots_left = how many videos we can still upload this cycle
+                # capped by both the daily quota remainder and the per-run limit
+                slots_left = min(daily_limit - uploaded_today, max_per_cycle)
+                logger.info(f"PipelineCoordinator: Upload budget this cycle: {slots_left} slot(s) (daily_limit={daily_limit}, uploaded_today={uploaded_today}, max_per_run={max_per_cycle}).")
                 
                 # Phase 3-Pre: Re-upload videos that were downloaded but failed to upload
                 if not is_youtube_blocked:
-                    uploadable = VideoDAO.get_uploadable_videos(limit=cycle_slots_left)
+                    uploadable = VideoDAO.get_uploadable_videos(limit=slots_left)
                     for video in uploadable:
-                        if cycle_slots_left <= 0:
+                        if slots_left <= 0:
                             break
                         dy_id = video['douyin_id']
                         title_short = (video['title'] or dy_id)[:50]
@@ -190,16 +192,15 @@ class PipelineCoordinator:
                         if yt_id:
                             VideoDAO.update_status(dy_id, 'uploaded')
                             self.notifier.push("重传成功", f"视频 [{title_short}] 重新上传YouTube成功!", "active")
-                            remaining_slots -= 1
-                            cycle_slots_left -= 1
+                            slots_left -= 1
 
                         else:
                             VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.get('retry_count', 0) + 1})
                             self.notifier.push("重传失败", f"视频 [{title_short}] 重新上传YouTube失败", "timeSensitive")
                 
                 # Phase 3-Main: Download + Upload new pending videos (if slots remain) 
-                if cycle_slots_left > 0:
-                    pending_videos = VideoDAO.get_pending_videos(limit=cycle_slots_left)
+                if slots_left > 0:
+                    pending_videos = VideoDAO.get_pending_videos(limit=slots_left)
                 else:
                     pending_videos = []
                     
