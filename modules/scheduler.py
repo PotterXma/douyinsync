@@ -60,6 +60,9 @@ class PipelineCoordinator:
         """Internal sync cycle, always called under lock."""
         logger.info("PipelineCoordinator: === Initiating Scheduled Primary Sync Cycle ===")
         
+        # Hot-reload configurations at the start of every cycle so dashboard limits reflect immediately
+        config.reload()
+
         if not self.check_network():
             logger.warning("PipelineCoordinator: Offline state detected. Aborting this sync cycle safely.")
             return
@@ -125,70 +128,153 @@ class PipelineCoordinator:
             
             if uploaded_today >= daily_limit:
                 logger.info(f"PipelineCoordinator: Daily upload limit reached ({uploaded_today}/{daily_limit}). Upload paused until tomorrow.")
-                pending_videos = []
             else:
-                # STRICT: always limit to 1 video per cycle
-                pending_videos = VideoDAO.get_pending_videos(limit=1)
+                remaining_slots = daily_limit - uploaded_today
+                max_per_cycle = config.get("max_videos_per_run", 1)
+                cycle_slots_left = min(remaining_slots, max_per_cycle)
                 
-            if pending_videos:
-                logger.info(f"PipelineCoordinator: Processing 1 video this cycle (strict single-video mode).")
-            
-            for video in pending_videos:
-                dy_id = video['douyin_id']
-                title_short = (video['title'] or dy_id)[:50]
-                VideoDAO.update_status(dy_id, 'processing')
-                
-                # Phase 3A: Download
-                paths = self.downloader.download_media(dy_id, video['video_url'], video['cover_url'])
-                if not paths:
-                    VideoDAO.update_status(dy_id, 'failed')
-                    self.notifier.push("下载失败", f"视频 [{title_short}] 下载失败", "timeSensitive")
-                    continue
-                
-                self.notifier.push("下载完成", f"视频 [{title_short}] 已保存到本地", "active")
-                    
-                # Phase 3A-Post: Store local mapping paths and lock downloaded
-                VideoDAO.update_status(dy_id, 'downloaded', {
-                    'local_video_path': paths['local_video_path'],
-                    'local_cover_path': paths['local_cover_path']
-                })
+                # Phase 3-Pre: Re-upload videos that were downloaded but failed to upload
+                if not is_youtube_blocked:
+                    uploadable = VideoDAO.get_uploadable_videos(limit=cycle_slots_left)
+                    for video in uploadable:
+                        if cycle_slots_left <= 0:
+                            break
+                        dy_id = video['douyin_id']
+                        title_short = (video['title'] or dy_id)[:50]
+                        local_video = video.get('local_video_path', '')
+                        local_cover = video.get('local_cover_path', '')
+                        
+                        # Verify local files still exist
+                        from pathlib import Path
+                        if not local_video or not Path(local_video).exists():
+                            logger.warning(f"PipelineCoordinator: Local video missing for [{dy_id}], skipping re-upload. Resetting to pending.")
+                            VideoDAO.update_status(dy_id, 'pending')
+                            continue
+                        
+                        logger.info(f"PipelineCoordinator: Re-uploading previously downloaded video [{dy_id}]")
+                        VideoDAO.update_status(dy_id, 'uploading')
+                        
+                        base_title = video['title'] or dy_id
+                        # Try to extract OCR text from cover filename pattern
+                        ocr_text = ""
+                        if local_cover and Path(local_cover).exists():
+                            try:
+                                from modules.win_ocr import get_text_from_image
+                                # Re-read OCR from the original jpg (not the _yt version)
+                                orig_jpg = Path(local_cover).parent / f"{dy_id}.jpg"
+                                if orig_jpg.exists():
+                                    extracted = get_text_from_image(str(orig_jpg))
+                                    if extracted:
+                                        ocr_text = " ".join(extracted.split())
+                            except Exception:
+                                pass
+                        
+                        if ocr_text:
+                            enhanced_title = f"{ocr_text} | {base_title}"[:90]
+                            enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+                        else:
+                            enhanced_title = base_title[:90]
+                            enhanced_desc = video['description']
+                        
+                        yt_id = self.uploader.upload_video_sequence(
+                            dy_id, local_video, local_cover, enhanced_title, enhanced_desc
+                        )
+                        
+                        if yt_id == "QUOTA_EXCEEDED":
+                            logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+                            self.notifier.push("Quota Exceeded", "YouTube API limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+                            self.youtube_quota_exceeded_until = time.time() + 86400
+                            VideoDAO.update_status(dy_id, 'downloaded')
+                            break
+                        
+                        if yt_id:
+                            VideoDAO.update_status(dy_id, 'uploaded')
+                            self.notifier.push("重传成功", f"视频 [{title_short}] 重新上传YouTube成功!", "active")
+                            remaining_slots -= 1
+                            cycle_slots_left -= 1
 
-                # Epic 4.3 Check Quota circuit
-                if is_youtube_blocked:
-                     continue # Hold it locked in downloaded state securely
-                     
-                # Phase 3B: Upload
-                VideoDAO.update_status(dy_id, 'uploading')
+                        else:
+                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.get('retry_count', 0) + 1})
+                            self.notifier.push("重传失败", f"视频 [{title_short}] 重新上传YouTube失败", "timeSensitive")
                 
-                ocr_text = paths.get('ocr_text', '')
-                base_title = video['title'] or dy_id
-                
-                # Prepend the OCR text dynamically to the YouTube title, max 90 chars total to be safe
-                if ocr_text:
-                    enhanced_title = f"{ocr_text} | {base_title}"[:90]
-                    enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+                # Phase 3-Main: Download + Upload new pending videos (if slots remain) 
+                if cycle_slots_left > 0:
+                    pending_videos = VideoDAO.get_pending_videos(limit=cycle_slots_left)
                 else:
-                    enhanced_title = base_title[:90]
-                    enhanced_desc = video['description']
+                    pending_videos = []
                     
-                yt_id = self.uploader.upload_video_sequence(
-                    dy_id, paths['local_video_path'], paths['local_cover_path'], enhanced_title, enhanced_desc
-                )
+                if pending_videos:
+                    logger.info(f"PipelineCoordinator: Processing {len(pending_videos)} new video(s) this cycle (max_per_run={max_per_cycle}).")
                 
-                if yt_id == "QUOTA_EXCEEDED":
-                    logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
-                    self.notifier.push("Quota Exceeded", "YouTube API daily limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
-                    self.youtube_quota_exceeded_until = time.time() + 86400
-                    VideoDAO.update_status(dy_id, 'downloaded') # Revert the 'uploading' lock
-                    continue
-                
-                if yt_id:
-                    # Successfully completely mapped
-                    VideoDAO.update_status(dy_id, 'uploaded')
-                    self.notifier.push("上传成功", f"视频 [{title_short}] 已成功上传YouTube!", "active")
-                else:
-                    VideoDAO.update_status(dy_id, 'failed')
-                    self.notifier.push("上传失败", f"视频 [{title_short}] 上传YouTube失败", "timeSensitive")
+                for video in pending_videos:
+                    dy_id = video['douyin_id']
+                    title_short = (video['title'] or dy_id)[:50]
+                    VideoDAO.update_status(dy_id, 'processing')
+                    
+                    # Phase 3A-Pre: Re-fetch fresh CDN URLs (Douyin CDN tokens expire quickly)
+                    video_url = video['video_url']
+                    cover_url = video['cover_url']
+                    try:
+                        fresh = self.fetcher.refresh_video_url(dy_id, douyin_accounts)
+                        if fresh:
+                            video_url = fresh.get('video_url', video_url)
+                            cover_url = fresh.get('cover_url', cover_url)
+                            VideoDAO.update_fresh_urls(dy_id, video_url, cover_url)
+                            logger.info(f"PipelineCoordinator: Refreshed CDN URLs for [{dy_id}]")
+                        else:
+                            logger.warning(f"PipelineCoordinator: Could not refresh URLs for [{dy_id}], using cached URLs.")
+                    except Exception as e:
+                        logger.warning(f"PipelineCoordinator: URL refresh failed for [{dy_id}]: {e}. Using cached URLs.")
+                    
+                    # Phase 3A: Download
+                    paths = self.downloader.download_media(dy_id, video_url, cover_url)
+                    if not paths:
+                        VideoDAO.update_status(dy_id, 'failed')
+                        self.notifier.push("下载失败", f"视频 [{title_short}] 下载失败", "timeSensitive")
+                        continue
+                    
+                    self.notifier.push("下载完成", f"视频 [{title_short}] 已保存到本地", "active")
+                        
+                    # Phase 3A-Post: Store local mapping paths and lock downloaded
+                    VideoDAO.update_status(dy_id, 'downloaded', {
+                        'local_video_path': paths['local_video_path'],
+                        'local_cover_path': paths['local_cover_path']
+                    })
+
+                    # Epic 4.3 Check Quota circuit
+                    if is_youtube_blocked:
+                         continue
+                         
+                    # Phase 3B: Upload
+                    VideoDAO.update_status(dy_id, 'uploading')
+                    
+                    ocr_text = paths.get('ocr_text', '')
+                    base_title = video['title'] or dy_id
+                    
+                    if ocr_text:
+                        enhanced_title = f"{ocr_text} | {base_title}"[:90]
+                        enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+                    else:
+                        enhanced_title = base_title[:90]
+                        enhanced_desc = video['description']
+                        
+                    yt_id = self.uploader.upload_video_sequence(
+                        dy_id, paths['local_video_path'], paths['local_cover_path'], enhanced_title, enhanced_desc
+                    )
+                    
+                    if yt_id == "QUOTA_EXCEEDED":
+                        logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+                        self.notifier.push("Quota Exceeded", "YouTube API daily limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+                        self.youtube_quota_exceeded_until = time.time() + 86400
+                        VideoDAO.update_status(dy_id, 'downloaded')
+                        continue
+                    
+                    if yt_id:
+                        VideoDAO.update_status(dy_id, 'uploaded')
+                        self.notifier.push("上传成功", f"视频 [{title_short}] 已成功上传YouTube!", "active")
+                    else:
+                        VideoDAO.update_status(dy_id, 'failed')
+                        self.notifier.push("上传失败", f"视频 [{title_short}] 上传YouTube失败", "timeSensitive")
 
         except Exception as e:
             logger.error(f"PipelineCoordinator: Unhandled Exception in main sync loop engine: {e}. Auto-Recovering for next cycle.")
