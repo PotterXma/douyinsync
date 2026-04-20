@@ -1,0 +1,17 @@
+2026-04-19 21:49:20,670 | === YouTube Upload Test START ===
+2026-04-19 21:49:21,436 | Loaded token from: D:\project\douyin搬运\dist\DouyinSync\youtube_token.json
+2026-04-19 21:49:21,617 | Building YouTube client with credentials (no httplib2)...
+2026-04-19 21:49:21,629 | YouTube client OK
+2026-04-19 21:49:21,633 | Video: 7356187469701844258.mp4 (15.7 MB)
+2026-04-19 21:49:21,698 | Starting upload...
+2026-04-19 21:49:21,713 | URL being requested: POST https://youtube.googleapis.com/upload/youtube/v3/videos?part=snippet%2Cstatus&alt=json&uploadType=resumable
+2026-04-19 21:49:27,428 | Progress: 12%
+2026-04-19 21:49:29,461 | Progress: 25%
+2026-04-19 21:49:32,008 | Progress: 38%
+2026-04-19 21:49:34,262 | Progress: 51%
+2026-04-19 21:49:36,003 | Progress: 63%
+2026-04-19 21:49:37,601 | Progress: 76%
+2026-04-19 21:49:39,281 | Progress: 89%
+2026-04-19 21:49:42,103 | SUCCESS! Video ID: gXVqW997omg
+2026-04-19 21:49:42,103 | URL: https://youtu.be/gXVqW997omg
+2026-04-19 21:49:42,103 | === YouTube Upload Test END ===

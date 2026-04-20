@@ -1,15 +1,16 @@
+import sys
 import sqlite3
 from pathlib import Path
 from contextlib import contextmanager
 
 from modules.logger import logger
 
-# Project root relative to this file
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    PROJECT_ROOT = Path(sys.executable).parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-DB_DIR = PROJECT_ROOT / "dist"
-DB_DIR.mkdir(exist_ok=True, parents=True)
-DB_FILE = DB_DIR / "douyinsync.db"
+DB_FILE = PROJECT_ROOT / "douyinsync.db"
 
 class DBManager:
     def __init__(self, db_path: Path):

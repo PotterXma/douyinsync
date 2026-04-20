@@ -4,35 +4,48 @@ import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw
 import threading
+from tkinter import messagebox
 
 from modules.logger import logger
 from modules.config_manager import config
 
-def create_image():
-    """Generates an elegant dynamic base icon (Blue box with white center) natively 
-    since we don't have .ico static files yet."""
+def create_image(status="running"):
+    """Generates an elegant dynamic base icon reflecting the monitoring status."""
     width = 64
     height = 64
-    color1 = (43, 108, 222)   # Deep pleasant blue
-    color2 = (255, 255, 255)  # White center
-    
-    image = Image.new('RGB', (width, height), color1)
+    image = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     dc = ImageDraw.Draw(image)
-    dc.rectangle(
-        (width // 4, height // 4, width * 3 // 4, height * 3 // 4),
-        fill=color2)
+    
+    if status == "running":
+        # Vibrant red/coral block
+        dc.rounded_rectangle((4, 14, 60, 50), radius=10, fill=(231, 76, 60))
+        # Play triangle pointing right
+        dc.polygon([(26, 22), (26, 42), (42, 32)], fill=(255, 255, 255))
+    else:
+        # Grayed out block for paused state
+        dc.rounded_rectangle((4, 14, 60, 50), radius=10, fill=(149, 165, 166))
+        # Pause vertical bars
+        dc.rectangle((24, 24, 30, 40), fill=(255, 255, 255))
+        dc.rectangle((34, 24, 40, 40), fill=(255, 255, 255))
+        
     return image
 
 class TrayController:
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
         self.icon = None
+        self.is_monitoring = True
+        self.coordinator = None  # Set by main.py after PipelineCoordinator is created
 
     def _setup_icon(self):
         # Construct dynamic Right-Click schema matching user layout
         menu = (
-            item('▶ 启动定时监控', self.action_start_monitor),
-            item('⏹ 停止定时监控', self.action_stop_monitor),
+            item(lambda text: '▶ 启动定时监控' if not self.is_monitoring else '▶ 启动定时监控 (已运行)', 
+                 self.action_start_monitor,
+                 enabled=lambda item: not self.is_monitoring),
+            item(lambda text: '⏹ 停止定时监控' if self.is_monitoring else '⏹ 停止定时监控 (已暂停)', 
+                 self.action_stop_monitor,
+                 enabled=lambda item: self.is_monitoring),
             item('─' * 20, self.no_action, enabled=False),
             item('⚙️ 搬运时间设置看板', self.action_open_settings),
             item('─' * 20, self.no_action, enabled=False),
@@ -44,7 +57,7 @@ class TrayController:
             item('─' * 20, self.no_action, enabled=False),
             item('❌ 退出程序', self.action_exit)
         )
-        self.icon = pystray.Icon("DouyinSync", create_image(), "DouyinSync Pipeline Daemon", menu)
+        self.icon = pystray.Icon("DouyinSync", create_image("running"), "DouyinSync Pipeline Daemon", menu)
 
     def no_action(self, icon, item):
         """Null route for display-only menu items."""
@@ -52,29 +65,52 @@ class TrayController:
 
     def action_start_monitor(self, icon, item):
         logger.info("Tray Menu UI: Triggered Start Monitor")
+        self.is_monitoring = True
+        self.icon.icon = create_image("running")
+        self.icon.update_menu()
+        messagebox.showinfo("服务状态", "定时监控引擎已激活。后台将在设定时间拉取资源。")
 
     def action_stop_monitor(self, icon, item):
         logger.info("Tray Menu UI: Triggered Stop Monitor")
+        self.is_monitoring = False
+        self.icon.icon = create_image("paused")
+        self.icon.update_menu()
+        messagebox.showinfo("服务状态", "定时监控引擎已暂停！")
 
     def action_open_settings(self, icon, item):
         logger.info("Tray Menu UI: Opening Settings Dashboard")
-        self.action_dashboard(icon, item)
+        import subprocess
+        import os
+        try:
+            if getattr(sys, 'frozen', False):
+                cmd = [sys.executable, "settings"]
+                subprocess.Popen(cmd)
+            else:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "main.py")
+                cmd = [sys.executable, path, "settings"]
+                subprocess.Popen(cmd)
+        except Exception as e:
+            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
 
     def action_manual_run(self, icon, item):
-        logger.info("Tray Menu UI: Manually running pipeline")
-        import subprocess
-        try:
-            # Fork testing pipeline manually
-            subprocess.Popen([sys.executable, "test_pipeline.py", "e2e"], shell=True)
-        except Exception as e:
-            logger.error(f"Manual Run Failed: {e}")
+        logger.info("Tray Menu UI: Manually running pipeline (in-process)")
+        if self.coordinator:
+            import threading
+            t = threading.Thread(target=self.coordinator.primary_sync_job, daemon=True)
+            t.start()
+        else:
+            logger.error("Tray Menu UI: No coordinator reference available for manual run.")
 
     def action_open_config_folder(self, icon, item):
         logger.info("Tray Menu UI: Opening Config Folder")
         import os
         import platform
-        path = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(path)
+        import sys
+        if getattr(sys, 'frozen', False):
+            project_root = os.path.dirname(sys.executable)
+        else:
+            path = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(path)
         if platform.system() == "Windows":
             os.startfile(project_root)
         elif platform.system() == "Darwin":
@@ -84,15 +120,31 @@ class TrayController:
 
     def action_view_stats(self, icon, item):
         logger.info("Tray Menu UI: Viewing Statistics")
-        self.action_dashboard(icon, item)
+        import subprocess
+        import os
+        try:
+            if getattr(sys, 'frozen', False):
+                cmd = [sys.executable, "stats"]
+                subprocess.Popen(cmd)
+            else:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "main.py")
+                cmd = [sys.executable, path, "stats"]
+                subprocess.Popen(cmd)
+        except Exception as e:
+            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
 
     def action_dashboard(self, icon, item):
-        """Epic 5.2: Dispatches the Tkinter script within an independent execution process. 
-        Critical defense ensuring the Main Thread UI lock remains exclusively possessed by pystray."""
         logger.info("Tray Menu UI: Constructing detached Python Process for Tkinter Dashboard...")
+        import subprocess
+        import os
         try:
-            # sys.executable securely targets the active virtual environment mapping.
-            subprocess.Popen([sys.executable, "-m", "modules.dashboard"])
+            if getattr(sys, 'frozen', False):
+                cmd = [sys.executable, "dashboard"]
+                subprocess.Popen(cmd)
+            else:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "main.py")
+                cmd = [sys.executable, path, "dashboard"]
+                subprocess.Popen(cmd)
         except Exception as e:
             logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
 

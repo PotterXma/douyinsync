@@ -21,12 +21,12 @@ class DouyinFetcher:
             return {"Cookie": cookie}
         return {}
 
-    def fetch_user_posts(self, user_url: str) -> list:
+    def fetch_user_posts(self, user_url: str, max_cursor: int = 0) -> tuple:
         """
-        Parses profile to get videos. 
-        Robust HTTP interface mapping Douyin API endpoint.
+        Parses profile to get videos with pagination support.
+        Returns tuple of (posts_list, next_cursor, has_more).
         """
-        logger.info(f"DouyinFetcher: Initiating scrape for URL -> {user_url}")
+        logger.info(f"DouyinFetcher: Initiating scrape for URL -> {user_url} (cursor={max_cursor})")
         
         current_headers = self.headers.copy()
         current_headers.update(self._get_cookie_header())
@@ -34,7 +34,7 @@ class DouyinFetcher:
         sec_user_id = self._extract_sec_user_id(user_url)
         if not sec_user_id:
             logger.error(f"DouyinFetcher: Could not extract valid sec_user_id from {user_url}")
-            return []
+            return [], 0, False
             
         # Use exact endpoint mapping
         query_dict = {
@@ -65,7 +65,7 @@ class DouyinFetcher:
             "round_trip_time": "200",
             "sec_user_id": sec_user_id,
             "count": 10,
-            "max_cursor": 0,
+            "max_cursor": max_cursor,
             "locate_query": "false",
             "show_live_replay_strategy": "1",
             "need_time_list": "1",
@@ -94,13 +94,17 @@ class DouyinFetcher:
             response.raise_for_status()
             data = response.json()
             
-            return self._parse_video_list(data)
+            posts = self._parse_video_list(data)
+            next_cursor = data.get("max_cursor", 0)
+            has_more = bool(data.get("has_more", 0))
+            
+            return posts, next_cursor, has_more
         except requests.RequestException as e:
             logger.error(f"DouyinFetcher: Network error during fetch. {e}")
-            return []
+            return [], 0, False
         except Exception as e:
             logger.error(f"DouyinFetcher: Exception during fetch payload parsing: {e}")
-            return []
+            return [], 0, False
 
     def _extract_sec_user_id(self, url: str) -> str:
         """Extracts the unique sec_user_id from standard profile sharing URLs."""

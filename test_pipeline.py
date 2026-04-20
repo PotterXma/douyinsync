@@ -23,7 +23,7 @@ def test_fetcher():
     url = first_account.get("url", "") if isinstance(first_account, dict) else str(first_account)
     logger.info(f"配置的首个目标账号URL: {url}")
 
-    posts = fetcher.fetch_user_posts(url)
+    posts, next_cursor, has_more = fetcher.fetch_user_posts(url)
     if not posts:
         logger.error("抓取失败或返回0个视频 (可能遇到WAF墙或者Cookie失效)。")
         return
@@ -95,12 +95,12 @@ def test_e2e():
     coord = PipelineCoordinator()
     coord.primary_sync_job()
 
-if __name__ == "__main__":
+def run_cli_mode():
     setup_logging()
     
     parser = argparse.ArgumentParser(description="分布式测试Douyin调度框架各个模块阶段")
     parser.add_argument("module", choices=["fetcher", "database", "downloader", "uploader", "e2e"],
-                        help="选择要测试的模块 (抓取, 数据库, 下载, 验证Youtube, 全链路).")
+                        help="选择要测试的模块")
     
     args = parser.parse_args()
     
@@ -116,3 +116,6 @@ if __name__ == "__main__":
         test_e2e()
     
     logger.info("---------- 测试流程结束 ----------")
+
+if __name__ == "__main__":
+    run_cli_mode()

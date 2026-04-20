@@ -2,10 +2,13 @@ import logging
 import os
 import re
 from logging.handlers import TimedRotatingFileHandler
+import sys
 from pathlib import Path
 
-# Project root relative to this file
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    PROJECT_ROOT = Path(sys.executable).parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Setup logs directory
 LOG_DIR = PROJECT_ROOT / "logs"

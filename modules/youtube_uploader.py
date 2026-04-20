@@ -10,10 +10,14 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+import sys
 from modules.logger import logger
 from modules.config_manager import config
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    PROJECT_ROOT = Path(sys.executable).parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 class YouTubeUploader:
     # Essential scopes for full YouTube Data API v3 upload ability
@@ -23,7 +27,7 @@ class YouTubeUploader:
         self.api_service_name = "youtube"
         self.api_version = "v3"
         self.client_secrets_file = PROJECT_ROOT / config.get("youtube_client_secret_file", "client_secret.json")
-        self.token_file = PROJECT_ROOT / "dist" / "youtube_token.json"
+        self.token_file = PROJECT_ROOT / "youtube_token.json"
         
         self.category_id = config.get("youtube_category_id", "22")
         self.privacy_status = config.get("youtube_privacy_status", "public")
@@ -58,54 +62,77 @@ class YouTubeUploader:
         """Boots the OAuth 2.0 flow securely or retrieves via cached refresh tokens."""
         creds = None
         
+        logger.info(f"YouTubeUploader: Token file path: {self.token_file}")
+        logger.info(f"YouTubeUploader: Client secrets path: {self.client_secrets_file}")
+        
         if self.token_file.exists():
             try:
                 creds = Credentials.from_authorized_user_file(str(self.token_file), self.SCOPES)
+                logger.info("YouTubeUploader: Loaded cached token successfully.")
             except Exception as e:
-                logger.warning(f"YouTubeUploader: Failed to parse cached token footprint. Rebooting auth cycle: {e}")
+                logger.warning(f"YouTubeUploader: Failed to parse cached token. Rebooting auth cycle: {e}")
                 
         # If no valid credentials, run the auth flow locally
         if not creds or not creds.valid:
             try:
                 if creds and creds.expired and creds.refresh_token:
-                    logger.info("YouTubeUploader: Token expired, requesting stealth refresh from Google Authority...")
+                    logger.info("YouTubeUploader: Token expired, requesting refresh from Google...")
                     try:
-                        creds.refresh(Request())
+                        # Use proxy-aware session for token refresh
+                        import google.auth.transport.requests
+                        import requests as req_lib
+                        
+                        session = req_lib.Session()
+                        proxies = config.get_proxies()
+                        if proxies:
+                            session.proxies.update(proxies)
+                            logger.info(f"YouTubeUploader: Using proxy for token refresh: {proxies.get('http', 'none')}")
+                        
+                        creds.refresh(google.auth.transport.requests.Request(session=session))
+                        logger.info("YouTubeUploader: Token refreshed successfully.")
                     except Exception as refresh_err:
-                        logger.warning(f"YouTubeUploader: Refresh token rejected/revoked. Forcing clean re-auth. {refresh_err}")
-                        creds = None # Force a fully fresh login
+                        logger.warning(f"YouTubeUploader: Refresh failed: {refresh_err}. Forcing re-auth.")
+                        creds = None
                 
                 if not creds:
                     if not self.client_secrets_file.exists():
-                        logger.error(f"YouTubeUploader: FATAL! Missing {self.client_secrets_file}. You must download OAuth client credentials from GCP!")
+                        logger.error(f"YouTubeUploader: FATAL! Missing {self.client_secrets_file}.")
                         return False
                     
-                    logger.info("YouTubeUploader: Triggering human-in-loop Web Authentication Flow. Please open browser.")
+                    logger.info("YouTubeUploader: Starting browser OAuth flow. Please complete login in browser.")
                     flow = InstalledAppFlow.from_client_secrets_file(
                         str(self.client_secrets_file), self.SCOPES
                     )
-                    creds = flow.run_local_server(port=0)
+                    creds = flow.run_local_server(port=0, open_browser=True)
+                    logger.info("YouTubeUploader: Browser auth completed successfully.")
                     
-                # Cache the token explicitly into disk
+                # Ensure parent directory exists before writing token
+                self.token_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(self.token_file, 'w') as token_cache:
                     token_cache.write(creds.to_json())
+                logger.info(f"YouTubeUploader: Token cached to {self.token_file}")
             except Exception as e:
-                logger.error(f"YouTubeUploader: Severe Authentication cycle failure: {e}")
+                logger.error(f"YouTubeUploader: Authentication failure: {e}")
+                import traceback
+                logger.error(f"YouTubeUploader: Traceback: {traceback.format_exc()}")
                 return False
                 
         try:
-            http_auth = self._build_proxy_http()
-            # Cache discovery disabled avoids massive unnecessary network roundtrips mapping out APIs
+            # Use google-auth native transport (requests-based) instead of httplib2
+            # httplib2 has a known bug: "Redirected but the response is missing a Location: header"
+            # during YouTube resumable uploads. credentials= param uses requests which works correctly.
             self.youtube_client = build(
                 self.api_service_name, 
                 self.api_version, 
                 credentials=creds, 
-                cache_discovery=False,
-                http=http_auth  # This forces proxy injection at the lowest socket level!
+                cache_discovery=False
             )
+            logger.info("YouTubeUploader: API service built successfully (google-auth native).")
             return True
         except Exception as e:
-            logger.error(f"YouTubeUploader: Failed to instantiate API Service architecture: {e}")
+            logger.error(f"YouTubeUploader: Failed to build API service: {e}")
+            import traceback
+            logger.error(f"YouTubeUploader: Traceback: {traceback.format_exc()}")
             return False
 
     def _sanitize_metadata(self, text: str, limit: int) -> str:
@@ -162,10 +189,38 @@ class YouTubeUploader:
             
             # Blocking byte transfer wrapper loop
             response = None
+            import time
+            last_log_time = time.time()
+            retry_count = 0
+            max_chunk_retries = 10
+            
             while response is None:
-                status, response = request.next_chunk()
-                if status:
-                    logger.debug(f"YouTubeUploader: Shipped {int(status.progress() * 100)}% of buffer payload...")
+                try:
+                    # num_retries=3 handles basic HTTP 5xx codes internally
+                    status, response = request.next_chunk(num_retries=3)
+                    if status:
+                        percent = int(status.progress() * 100)
+                        if time.time() - last_log_time >= 5.0 or percent == 100:
+                            logger.info(f"YouTubeUploader: Uploading stream payload... {percent}% done")
+                            last_log_time = time.time()
+                    # Reset generic retry count upon successful progress
+                    retry_count = 0
+                except Exception as e:
+                    # Catch all network-level drops (SSL EOF, connection reset, read timeout)
+                    err_str = str(e).lower()
+                    if "quota" in err_str or "forbidden" in err_str or "403" in err_str:
+                        raise # Do not retry Quota exceptions or hard API bans
+                    
+                    retry_count += 1
+                    logger.warning(f"YouTubeUploader: Chunk upload interrupted ({retry_count}/{max_chunk_retries}): {e}")
+                    
+                    if retry_count > max_chunk_retries:
+                        logger.error(f"YouTubeUploader: Max chunk retries reached. Aborting upload.")
+                        raise
+                        
+                    sleep_time = min(60, 2 ** retry_count)
+                    logger.info(f"YouTubeUploader: Sleeping for {sleep_time}s before resuming chunk upload...")
+                    time.sleep(sleep_time)
 
             yt_video_id = response.get('id')
             logger.info(f"YouTubeUploader: SUCCESS! Video broadcast complete. https://youtu.be/{yt_video_id}")
@@ -188,9 +243,10 @@ class YouTubeUploader:
         """Attaches the converted JPEG cover precisely onto the freshly minted video node."""
         try:
             logger.info(f"YouTubeUploader: Commencing Custom Thumbnail API injection for hook [{video_id}]...")
+            # Explicitly setting mimetype='image/jpeg' bypasses Windows Registry MIME guessing bugs
             self.youtube_client.thumbnails().set(
                 videoId=video_id,
-                media_body=MediaFileUpload(cover_path)
+                media_body=MediaFileUpload(cover_path, mimetype='image/jpeg')
             ).execute()
             logger.debug(f"YouTubeUploader: Custom Thumbnail mounted flawlessly.")
         except Exception as e:

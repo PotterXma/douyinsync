@@ -2,9 +2,14 @@ import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
+import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_FILE = PROJECT_ROOT / "dist" / "douyinsync.db"
+if getattr(sys, 'frozen', False):
+    PROJECT_ROOT = Path(sys.executable).parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DB_FILE = PROJECT_ROOT / "douyinsync.db"
 
 class SyncDashboard:
     def __init__(self, root):
@@ -117,7 +122,10 @@ class SyncDashboard:
             except Exception as e:
                 messagebox.showerror("重置失败", f"遇到错误: {e}")
 
-if __name__ == "__main__":
+def run_dashboard():
     app = tk.Tk()
     dashboard = SyncDashboard(app)
     app.mainloop()
+
+if __name__ == "__main__":
+    run_dashboard()

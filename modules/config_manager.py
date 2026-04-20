@@ -1,8 +1,12 @@
+import sys
 import json
 from pathlib import Path
 from modules.logger import logger
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    PROJECT_ROOT = Path(sys.executable).parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 class ConfigManager:
     _instance = None
