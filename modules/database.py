@@ -1,9 +1,11 @@
 import sys
 import sqlite3
+import time
 from pathlib import Path
 from contextlib import contextmanager
 
 from modules.logger import logger
+from utils.models import VideoRecord
 
 if getattr(sys, 'frozen', False):
     PROJECT_ROOT = Path(sys.executable).parent
@@ -12,16 +14,19 @@ else:
 
 DB_FILE = PROJECT_ROOT / "douyinsync.db"
 
-class DBManager:
+class DatabaseConnectionError(Exception):
+    """Specific exception raised when the database connection fails or cannot be initialized."""
+    pass
+
+class AppDatabase:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._initialize_db()
         
-    def _initialize_db(self):
+    def _initialize_db(self) -> None:
         """Ensures the sqlite database file exists and PRAGMAs are set."""
         try:
             with self.get_connection() as conn:
-                # Setup WAL Mode for high concurrency reads/writes
                 cursor = conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL;")
                 cursor.execute("PRAGMA synchronous=NORMAL;")
@@ -29,12 +34,15 @@ class DBManager:
                 cursor.execute("PRAGMA busy_timeout=10000;")
                 self._create_tables(cursor)
                 journal_mode = cursor.execute("PRAGMA journal_mode;").fetchone()[0]
-                logger.debug(f"Database initialized. Journal mode: {journal_mode}")
+                logger.debug("Database initialized. Journal mode: %s", journal_mode)
         except OSError as e:
-            logger.critical(f"Failed to access database file at {self.db_path}: {e}")
-            raise
+            logger.critical("Failed to access database file at %s: %s", self.db_path, e)
+            raise DatabaseConnectionError(f"Failed to access database file: {e}")
+        except sqlite3.Error as e:
+            logger.critical("SQLite error during initialization: %s", e)
+            raise DatabaseConnectionError(f"SQLite error during initialization: {e}")
             
-    def _create_tables(self, cursor):
+    def _create_tables(self, cursor: sqlite3.Cursor) -> None:
         """Creates required schemas if they do not exist."""
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS videos (
@@ -48,8 +56,8 @@ class DBManager:
                 retry_count INTEGER DEFAULT 0,
                 local_video_path TEXT,
                 local_cover_path TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at INTEGER,
+                updated_at INTEGER
             )
         """)
             
@@ -58,43 +66,69 @@ class DBManager:
         """Context manager for yielding a tracked sqlite connection."""
         conn = None
         try:
-            # timeout parameter prevents locking during concurrent UI/Background polling
             conn = sqlite3.connect(
                 self.db_path, 
                 timeout=10.0, 
-                isolation_level=None  # autocommit mode, transactions must be explicitly managed if needed
+                isolation_level=None  # autocommit mode, transactions explicitly managed
             )
-            # Fetch as dicts for easier consumption
             conn.row_factory = sqlite3.Row
             yield conn
+        except sqlite3.Error as e:
+            logger.error("Failed to connect to SQLite DB: %s", e)
+            raise DatabaseConnectionError(f"Connection failed: {e}")
         finally:
             if conn:
                 conn.close()
 
-db = DBManager(DB_FILE)
+db = AppDatabase(DB_FILE)
 
 class VideoDAO:
-    """Data Access Object wrapper for handling specific domain queries over DBManager."""
+    """Data Access Object wrapper for handling specific domain queries over AppDatabase."""
+    
     @staticmethod
-    def insert_video_if_unique(video_data: dict) -> bool:
+    def _row_to_record(row: sqlite3.Row) -> VideoRecord:
+        """Helper to safely map a sqlite row to a VideoRecord."""
+        return VideoRecord(
+            douyin_id=row['douyin_id'],
+            account_mark=row['account_mark'],
+            title=row['title'],
+            description=row['description'],
+            video_url=row['video_url'],
+            cover_url=row['cover_url'],
+            status=row['status'],
+            retry_count=row['retry_count'],
+            local_video_path=row['local_video_path'],
+            local_cover_path=row['local_cover_path'],
+            created_at=row['created_at'],
+            updated_at=row['updated_at']
+        )
+
+    @staticmethod
+    def insert_video_if_unique(record: VideoRecord) -> bool:
         """
         Idempotent insert. Ignores if douyin_id already exists.
         Returns True if a new row was inserted, False if it was completely ignored.
         """
         sql = """
             INSERT OR IGNORE INTO videos (
-                douyin_id, account_mark, title, description, video_url, cover_url
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                douyin_id, account_mark, title, description, video_url, cover_url,
+                status, retry_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
+        now = int(time.time())
         with db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(sql, (
-                video_data.get('douyin_id'),
-                video_data.get('account_mark', ''),
-                video_data.get('title', ''),
-                video_data.get('description', ''),
-                video_data.get('video_url', ''),
-                video_data.get('cover_url', '')
+                record.douyin_id,
+                record.account_mark,
+                record.title,
+                record.description,
+                record.video_url,
+                record.cover_url,
+                record.status,
+                record.retry_count,
+                now,
+                now
             ))
             return cursor.rowcount > 0
 
@@ -104,8 +138,9 @@ class VideoDAO:
         if extra_updates is None:
             extra_updates = {}
         
-        updates = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
-        params = [new_status]
+        updates = ["status = ?", "updated_at = ?"]
+        now = int(time.time())
+        params = [new_status, now]
         
         for k, v in extra_updates.items():
             updates.append(f"{k} = ?")
@@ -119,28 +154,24 @@ class VideoDAO:
             conn.execute(sql, tuple(params))
 
     @staticmethod
-    def get_pending_videos(limit: int = 5) -> list:
-        """Retrieves outstanding elements marked as 'pending' mapping them back to python dicts."""
-        sql = "SELECT douyin_id, title, description, video_url, cover_url FROM videos WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?"
+    def get_pending_videos(limit: int = 5) -> list[VideoRecord]:
+        """Retrieves outstanding elements marked as 'pending' mapping them back to VideoRecord."""
+        sql = "SELECT * FROM videos WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?"
         results = []
         with db.get_connection() as conn:
             cursor = conn.cursor()
             for row in cursor.execute(sql, (limit,)):
-                results.append({
-                    'douyin_id': row[0],
-                    'title': row[1],
-                    'description': row[2],
-                    'video_url': row[3],
-                    'cover_url': row[4]
-                })
+                results.append(VideoDAO._row_to_record(row))
         return results
 
     @staticmethod
-    def get_uploadable_videos(limit: int = 1) -> list:
-        """Retrieves videos that were downloaded but failed to upload (status='downloaded' or 'failed' with local paths).
-        Only returns videos with retry_count < 3 to prevent infinite retry loops."""
+    def get_uploadable_videos(limit: int = 1) -> list[VideoRecord]:
+        """
+        Retrieves videos that were downloaded but failed to upload (status='downloaded' or 'failed' with local paths).
+        Only returns videos with retry_count < 3 to prevent infinite retry loops.
+        """
         sql = """
-            SELECT douyin_id, title, description, video_url, cover_url, local_video_path, local_cover_path 
+            SELECT *
             FROM videos 
             WHERE ((status = 'downloaded') OR (status = 'failed' AND local_video_path IS NOT NULL AND local_video_path != ''))
               AND retry_count < 3
@@ -150,21 +181,19 @@ class VideoDAO:
         with db.get_connection() as conn:
             cursor = conn.cursor()
             for row in cursor.execute(sql, (limit,)):
-                results.append({
-                    'douyin_id': row[0],
-                    'title': row[1],
-                    'description': row[2],
-                    'video_url': row[3],
-                    'cover_url': row[4],
-                    'local_video_path': row[5],
-                    'local_cover_path': row[6]
-                })
+                results.append(VideoDAO._row_to_record(row))
         return results
 
     @staticmethod
     def get_uploaded_today_count() -> int:
-        """Counts how many videos successfully uploaded locally today."""
-        sql = "SELECT COUNT(*) FROM videos WHERE status = 'uploaded' AND date(updated_at, 'localtime') = date(datetime('now'), 'localtime')"
+        """Counts how many videos successfully uploaded locally today (timezone handled purely via python logic or naive for int)."""
+        # We need a proper way to count today but since we use INTEGER timestamps, 
+        # it's best to compute start of day locally and use >= start_of_day.
+        # Since this involves timezone and sqlite integer representation 
+        current_time_str = time.strftime('%Y-%m-%d')
+        # However, to avoid python-only overhead, if we convert unix timestamp to local ISO, we can match
+        # date(datetime(updated_at, 'unixepoch', 'localtime')) == date('now', 'localtime')
+        sql = "SELECT COUNT(*) FROM videos WHERE status = 'uploaded' AND date(datetime(updated_at, 'unixepoch', 'localtime')) = date('now', 'localtime')"
         with db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(sql)
@@ -176,36 +205,36 @@ class VideoDAO:
         Self-Healing Mechanism (Story 4.4):
         Locates any rows left 'processing' upon shutdown, reverting them so they aren't totally lost.
         """
+        now = int(time.time())
         sql_revert_processing = """
             UPDATE videos 
-            SET status = 'pending', retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP 
+            SET status = 'pending', retry_count = retry_count + 1, updated_at = ?
             WHERE status = 'processing' OR status = 'downloading'
         """
-        # uploading = local file already exists, only upload failed -> revert to 'downloaded' not 'pending'
         sql_revert_uploading = """
             UPDATE videos
-            SET status = 'downloaded', retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP
+            SET status = 'downloaded', retry_count = retry_count + 1, updated_at = ?
             WHERE status = 'uploading'
         """
         sql_fail_loop = """
             UPDATE videos
-            SET status = 'give_up_fatal', updated_at = CURRENT_TIMESTAMP
+            SET status = 'give_up_fatal', updated_at = ?
             WHERE status = 'pending' AND retry_count >= 3
         """
         with db.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql_revert_processing)
+            cursor.execute(sql_revert_processing, (now,))
             reverted = cursor.rowcount
-            cursor.execute(sql_revert_uploading)
+            cursor.execute(sql_revert_uploading, (now,))
             reverted += cursor.rowcount
-            # Apply infinite loop defense limit
-            cursor.execute(sql_fail_loop)
+            cursor.execute(sql_fail_loop, (now,))
             
             return reverted
 
     @staticmethod
     def update_fresh_urls(douyin_id: str, video_url: str, cover_url: str) -> None:
         """Updates cached CDN URLs with fresh ones to prevent stale token 403 errors."""
-        sql = "UPDATE videos SET video_url = ?, cover_url = ?, updated_at = CURRENT_TIMESTAMP WHERE douyin_id = ?"
+        sql = "UPDATE videos SET video_url = ?, cover_url = ?, updated_at = ? WHERE douyin_id = ?"
+        now = int(time.time())
         with db.get_connection() as conn:
-            conn.execute(sql, (video_url, cover_url, douyin_id))
+            conn.execute(sql, (video_url, cover_url, now, douyin_id))

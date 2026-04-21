@@ -6,7 +6,9 @@ from datetime import datetime
 from modules.logger import logger
 from modules.abogus import USERAGENT
 
+import os
 import sys
+import time
 
 if getattr(sys, 'frozen', False):
     PROJECT_ROOT = Path(sys.executable).parent
@@ -74,7 +76,6 @@ class Downloader:
                         candidates = [
                             PROJECT_ROOT / "og.jpg",
                             PROJECT_ROOT.parent / "og.jpg",
-                            Path("D:/project/douyin搬运/dist/og.jpg")
                         ]
                         for c in candidates:
                             if c.exists():
@@ -112,7 +113,7 @@ class Downloader:
                                         "C:\\Windows\\Fonts\\simhei.ttf"
                                     ]
                                     for f in fallback_fonts:
-                                        if __import__('os').path.exists(f):
+                                        if os.path.exists(f):
                                             font_path = f
                                             break
                                         
@@ -192,7 +193,6 @@ class Downloader:
     def _download_file(self, url: str, dest_path: Path, chunk_size=8192) -> bool:
         """Hardware-safe file dumping method. Blocks memory balloons for 500MB+ files."""
         from modules.config_manager import config
-        
         headers = {
             "User-Agent": USERAGENT,
             "Referer": "https://www.douyin.com/"
@@ -212,7 +212,6 @@ class Downloader:
                 # timeout=(connect_timeout, read_timeout)
                 # connect: 10s to establish connection
                 # read: 120s max wait between chunks (large videos need more time)
-                import time
                 req_headers = headers.copy()
                 if downloaded > 0:
                     req_headers["Range"] = f"bytes={downloaded}-"
@@ -282,7 +281,6 @@ class Downloader:
                 logger.error(f"Downloader: HTTP Error {e.response.status_code}: {e}")
                 if attempt < max_retries - 1:
                     logger.info(f"Downloader: Retrying download ({attempt + 1}/{max_retries})...")
-                    import time
                     time.sleep(2)
                     continue
                 return False
@@ -291,7 +289,6 @@ class Downloader:
                 logger.error(f"Downloader: Stream HTTP disconnect mapping URL {url[:80]}... : {e}")
                 if attempt < max_retries - 1:
                     logger.info(f"Downloader: Retrying download ({attempt + 1}/{max_retries})...")
-                    import time
                     time.sleep(2)
                     continue
                 return False

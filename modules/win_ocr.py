@@ -53,7 +53,10 @@ def get_text_from_image(image_path: str) -> str:
                 
             t = threading.Thread(target=run_in_thread)
             t.start()
-            t.join()
+            t.join(timeout=30)  # R7: 30s max - prevents pipeline deadlock if OCR engine hangs
+            if t.is_alive():
+                logger.warning("win_ocr: OCR thread timed out after 30s. Skipping OCR for this image.")
+                return ""
             return result_container[0] if result_container else ""
         else:
             # Main thread fast path

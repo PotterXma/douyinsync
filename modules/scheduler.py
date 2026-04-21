@@ -268,11 +268,15 @@ class PipelineCoordinator:
                         self.notifier.push("Quota Exceeded", "YouTube API daily limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
                         self.youtube_quota_exceeded_until = time.time() + 86400
                         VideoDAO.update_status(dy_id, 'downloaded')
-                        continue
+                        break  # Stop processing remaining pending videos
                     
                     if yt_id:
                         VideoDAO.update_status(dy_id, 'uploaded')
                         self.notifier.push("上传成功", f"视频 [{title_short}] 已成功上传YouTube!", "active")
+                        slots_left -= 1  # R1: decrement to prevent daily limit overrun
+                        if slots_left <= 0:
+                            logger.info("PipelineCoordinator: All upload slots consumed. Ending cycle.")
+                            break
                     else:
                         VideoDAO.update_status(dy_id, 'failed')
                         self.notifier.push("上传失败", f"视频 [{title_short}] 上传YouTube失败", "timeSensitive")
