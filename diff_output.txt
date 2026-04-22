@@ -1,0 +1,174 @@
+﻿diff --git a/ui/dashboard_app.py b/ui/dashboard_app.py
+new file mode 100644
+index 0000000..d2d3e05
+--- /dev/null
++++ b/ui/dashboard_app.py
+@@ -0,0 +1,98 @@
++import sqlite3
++import customtkinter as ctk
++from typing import Dict, Any
++
++from modules.database import VideoDAO, DatabaseConnectionError
++from modules.logger import logger
++
++ctk.set_appearance_mode("dark")
++ctk.set_default_color_theme("blue")
++
++class PipelineStatusCard(ctk.CTkFrame):
++    def __init__(self, master, account_mark, **kwargs):
++        super().__init__(master, **kwargs)
++        self.account_mark = account_mark
++        self.lbl_title = ctk.CTkLabel(self, text=account_mark, font=("Inter", 14, "bold"))
++        self.lbl_title.pack(anchor="w", padx=10, pady=5)
++        self.lbl_status = ctk.CTkLabel(self, text="status: unknown")
++        self.lbl_status.pack(anchor="w", padx=10, pady=2)
++
++class DashboardApp:
++    def __init__(self):
++        self.root = ctk.CTk()
++        self.root.title("DouyinSync Dashboard")
++        self.root.geometry("400x600")
++        
++        # UI requirements from tests and architecture
++        self.progress_bar = ctk.CTkProgressBar(self.root)
++        self.progress_bar.pack(pady=10, padx=20, fill="x")
++        self.progress_bar.set(0)
++        
++        # Telemetry Labels
++        self.lbl_total_processed = ctk.CTkLabel(self.root, text="Processed: 0")
++        self.lbl_total_processed.pack()
++        self.lbl_total_success = ctk.CTkLabel(self.root, text="Success: 0")
++        self.lbl_total_success.pack()
++        self.lbl_pending = ctk.CTkLabel(self.root, text="Pending: 0")
++        self.lbl_pending.pack()
++        self.lbl_failed = ctk.CTkLabel(self.root, text="Failed: 0")
++        self.lbl_failed.pack()
++        self.lbl_give_up = ctk.CTkLabel(self.root, text="Fatal Give Up: 0")
++        self.lbl_give_up.pack()
++        
++        self.cards: Dict[str, PipelineStatusCard] = {}
++        
++        self.root.bind("<FocusOut>", self._on_focus_out)
++        
++        # Start DB Polling loop
++        self.root.after(3000, self.poll_db)
++        
++    def _on_focus_out(self, event):
++        if hasattr(event, 'widget') and getattr(event, 'widget') == self.root:
++            self.root.withdraw()
++            
++    def show(self):
++        self.root.deiconify()
++        
++    def update_data_layer(self, data: Dict[str, dict]):
++        for account, info in data.items():
++            if account not in self.cards:
++                self.cards[account] = PipelineStatusCard(self.root, account)
++                self.cards[account].pack(pady=5, padx=20, fill="x")
++            card = self.cards[account]
++            card.lbl_status.configure(text=f"status: {info.get('status', 'unknown')}")
++
++    def poll_db(self):
++        try:
++            stats = VideoDAO.get_pipeline_stats()
++            # Map stats explicitly
++            uploaded_count = stats.get("uploaded", 0)
++            pending_count = stats.get("pending", 0)
++            processing_count = stats.get("processing", 0) + stats.get("downloading", 0) + stats.get("uploading", 0)
++            downloaded_count = stats.get("downloaded", 0)
++            failed_count = stats.get("failed", 0)
++            give_up_count = stats.get("give_up_fatal", 0) + stats.get("give_up", 0)
++            
++            total_processed = uploaded_count + processing_count + failed_count + downloaded_count
++            
++            self.lbl_total_processed.configure(text=f"Processed: {total_processed}")
++            self.lbl_total_success.configure(text=f"Success: {uploaded_count}")
++            self.lbl_pending.configure(text=f"Pending: {pending_count}")
++            self.lbl_failed.configure(text=f"Failed: {failed_count}")
++            self.lbl_give_up.configure(text=f"Fatal Give Up: {give_up_count}")
++            
++        except sqlite3.Error as e:
++            logger.error("DB Poll failed (sqlite3.Error): %s", e)
++        except DatabaseConnectionError as e:
++            logger.error("DB Poll failed (Connection): %s", e)
++        except Exception as e:
++            logger.error("DB Poll failed (Unknown): %s", e)
++        finally:
++            self.root.after(3000, self.poll_db)
++
++    def run(self):
++        self.root.mainloop()
++
++if __name__ == "__main__":
++    app = DashboardApp()
++    app.run()
+diff --git a/tests/test_dashboard_app.py b/tests/test_dashboard_app.py
+new file mode 100644
+index 0000000..2071475
+--- /dev/null
++++ b/tests/test_dashboard_app.py
+@@ -0,0 +1,49 @@
++import pytest
++from unittest.mock import patch, MagicMock
++import customtkinter as ctk
++
++# We patch customtkinter completely or partial to avoid opening windows during CI/tests
++from ui.dashboard_app import DashboardApp, PipelineStatusCard
++
++@patch("ui.dashboard_app.ctk.CTk.mainloop")
++@patch("ui.dashboard_app.ctk.CTk.withdraw")
++@patch("ui.dashboard_app.ctk.CTk.deiconify")
++def test_dashboard_initialization(mock_deiconify, mock_withdraw, mock_mainloop):
++    app = DashboardApp()
++    
++    assert hasattr(app, "root")
++    
++    class DummyEvent:
++        pass
++    dummy_event = DummyEvent()
++    dummy_event.widget = app.root
++    
++    app._on_focus_out(dummy_event)
++    mock_withdraw.assert_called_once()
++    
++    app.show()
++    mock_deiconify.assert_called_once()
++
++@patch("ui.dashboard_app.ctk.CTk.mainloop")
++def test_global_hud_components(mock_mainloop):
++    app = DashboardApp()
++    
++    # Needs to render a progress bar and labels
++    assert hasattr(app, "progress_bar")
++    assert isinstance(app.progress_bar, ctk.CTkProgressBar)
++    assert hasattr(app, "lbl_total_processed")
++    assert hasattr(app, "lbl_total_success")
++
++@patch("ui.dashboard_app.ctk.CTk.mainloop")
++def test_pipeline_status_card(mock_mainloop):
++    app = DashboardApp()
++    # It should have a method to update cards or create them
++    app.update_data_layer({"test_account": {"status": "pending", "success": 0, "total": 0}})
++    
++    assert "test_account" in app.cards
++    card = app.cards["test_account"]
++    assert isinstance(card, PipelineStatusCard)
++    
++    # Check if we can change status
++    app.update_data_layer({"test_account": {"status": "failed", "success": 5, "total": 10}})
++    # Let's say if failed, action button changes or becomes visible
+diff --git a/requirements.txt b/requirements.txt
+index 88acf68..af93a77 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,4 @@
+-pystray
++pystray[win32]
+ Pillow
+ requests
+ apscheduler
+@@ -6,3 +6,4 @@ google-api-python-client
+ google-auth-oauthlib
+ google-auth-httplib2
+ httplib2
++customtkinter

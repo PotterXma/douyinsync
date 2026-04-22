@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Any
 
 @dataclass
 class TargetConfig:
@@ -30,3 +30,17 @@ class VideoRecord:
     local_cover_path: Optional[str] = None
     created_at: Optional[int] = None
     updated_at: Optional[int] = None
+
+class YoutubeUploadError(Exception):
+    pass
+
+class YoutubeQuotaError(YoutubeUploadError):
+    pass
+
+class YoutubeNetworkError(YoutubeUploadError):
+    pass
+
+@dataclass
+class AppEvent:
+    command: str
+    payload: Optional[Any] = None

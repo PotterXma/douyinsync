@@ -1,0 +1,42 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0
+rootdir: D:\project\douyin搬运
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 74 items
+
+tests\test_config_manager.py ....                                        [  5%]
+tests\test_dashboard_app.py ...                                          [  9%]
+tests\test_database.py .....                                             [ 16%]
+tests\test_douyin_api.py ...........                                     [ 31%]
+tests\test_douyin_fetcher.py ...                                         [ 35%]
+tests\test_downloader.py .....                                           [ 41%]
+tests\test_notifier.py .........                                         [ 54%]
+tests\test_resilience.py ....                                            [ 59%]
+tests\test_sanitizer.py ...................                              [ 85%]
+tests\test_scheduler.py ...                                              [ 89%]
+tests\test_tray_icon.py ...                                              [ 93%]
+tests\test_youtube_uploader.py .....                                     [100%]
+
+============================== warnings summary ===============================
+utils\decorators.py:104
+tests/test_resilience.py::test_circuit_breaker_async_youtube_quota
+  D:\project\douyin搬运\utils\decorators.py:104: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    if asyncio.iscoroutinefunction(func):
+
+utils\decorators.py:37
+tests/test_resilience.py::test_auto_retry_async_success
+tests/test_resilience.py::test_auto_retry_async_exhausted
+tests/test_resilience.py::test_auto_retry_sync_success
+  D:\project\douyin搬运\utils\decorators.py:37: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    if asyncio.iscoroutinefunction(func):
+
+tests/test_downloader.py::TestDownloader::test_download_file_returns_false_on_network_error
+tests/test_downloader.py::TestDownloader::test_download_file_aborts_on_403
+  D:\project\douyin搬运\modules\downloader.py:220: RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never awaited
+    async with client.stream("GET", url, headers=req_headers) as r:
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 74 passed, 8 warnings in 23.43s =======================

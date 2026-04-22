@@ -1,9 +1,13 @@
-import requests
+import httpx
 import json
 from urllib.parse import urlparse, urlencode, quote
+from typing import List, Tuple, Optional
+
 from modules.logger import logger
 from modules.config_manager import config
 from modules.abogus import ABogus, USERAGENT
+from utils.models import VideoRecord
+from utils.decorators import auto_retry, circuit_breaker
 
 class DouyinFetcher:
     def __init__(self):
@@ -14,6 +18,13 @@ class DouyinFetcher:
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "gzip, deflate"
         }
+        self.client = httpx.AsyncClient(timeout=15.0)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.client.aclose()
 
     def _get_cookie_header(self):
         cookie = str(config.get("douyin_cookie", "")).strip()
@@ -21,19 +32,21 @@ class DouyinFetcher:
             return {"Cookie": cookie}
         return {}
 
-    def fetch_user_posts(self, user_url: str, max_cursor: int = 0) -> tuple:
+    @auto_retry(max_retries=3, exceptions=(httpx.RequestError,))
+    @circuit_breaker(trip_on=(httpx.HTTPStatusError,))
+    async def fetch_user_posts(self, user_url: str, max_cursor: int = 0) -> Tuple[List[VideoRecord], int, bool]:
         """
         Parses profile to get videos with pagination support.
         Returns tuple of (posts_list, next_cursor, has_more).
         """
-        logger.info(f"DouyinFetcher: Initiating scrape for URL -> {user_url} (cursor={max_cursor})")
+        logger.info("DouyinFetcher: Initiating scrape for URL -> %s (cursor=%s)", user_url, max_cursor)
         
         current_headers = self.headers.copy()
         current_headers.update(self._get_cookie_header())
         
         sec_user_id = self._extract_sec_user_id(user_url)
         if not sec_user_id:
-            logger.error(f"DouyinFetcher: Could not extract valid sec_user_id from {user_url}")
+            logger.error("DouyinFetcher: Could not extract valid sec_user_id from %s", user_url)
             return [], 0, False
             
         # Use exact endpoint mapping
@@ -90,7 +103,7 @@ class DouyinFetcher:
         
         try:
             # We enforce direct domestic connection (No Proxy) to hit Douyin smoothly usually.
-            response = requests.get(api_url, headers=current_headers, timeout=15.0)
+            response = await self.client.get(api_url, headers=current_headers)
             response.raise_for_status()
             data = response.json()
             
@@ -99,11 +112,11 @@ class DouyinFetcher:
             has_more = bool(data.get("has_more", 0))
             
             return posts, next_cursor, has_more
-        except requests.RequestException as e:
-            logger.error(f"DouyinFetcher: Network error during fetch. {e}")
+        except httpx.RequestError as e:
+            logger.error("DouyinFetcher: Network error during fetch. %s", e)
             return [], 0, False
         except Exception as e:
-            logger.error(f"DouyinFetcher: Exception during fetch payload parsing: {e}")
+            logger.error("DouyinFetcher: Exception during fetch payload parsing: %s", e)
             return [], 0, False
 
     def _extract_sec_user_id(self, url: str) -> str:
@@ -116,12 +129,12 @@ class DouyinFetcher:
                 if idx + 1 < len(parts):
                     return parts[idx + 1]
         except Exception as e:
-            logger.debug(f"Failed to URL-parse {url}: {e}")
+            logger.debug("Failed to URL-parse %s: %s", url, e)
         return ""
 
-    def _parse_video_list(self, json_data: dict) -> list:
-        """Safely distills Douyin JSON into generic pipeline dict metadata."""
-        results = []
+    def _parse_video_list(self, json_data: dict) -> List[VideoRecord]:
+        """Safely distills Douyin JSON into strongly-typed VideoRecord instances."""
+        results: List[VideoRecord] = []
         if not isinstance(json_data, dict):
             logger.warning("DouyinFetcher: Invalid JSON payload root format.")
             return results
@@ -134,7 +147,7 @@ class DouyinFetcher:
         for item in aweme_list:
             # Filter Layer: Discard Tuwen (Image posts) protecting downstream YouTube Uploader
             if item.get("images") is not None or item.get("aweme_type") == 68:
-                logger.debug(f"DouyinFetcher: Filtering out unsupported Image-Post. ID: {item.get('aweme_id')}")
+                logger.debug("DouyinFetcher: Filtering out unsupported Image-Post. ID: %s", item.get('aweme_id'))
                 continue
                 
             try:
@@ -163,21 +176,21 @@ class DouyinFetcher:
                 cover_addr = video_info.get("cover", {}).get("url_list", [])
                 cover_url = cover_addr[0] if cover_addr else ""
                 
-                results.append({
-                    "douyin_id": str(douyin_id),
-                    "title": title[:300], # Soft fail-safe limit
-                    "description": title,
-                    "video_url": video_url,
-                    "cover_url": cover_url
-                })
+                results.append(VideoRecord(
+                    douyin_id=str(douyin_id),
+                    title=title[:300],       # Soft fail-safe limit
+                    description=title,
+                    video_url=video_url,
+                    cover_url=cover_url,
+                ))
             except KeyError as e:
-                logger.debug(f"DouyinFetcher: Skipped item missing fundamental keys {e}")
+                logger.debug("DouyinFetcher: Skipped item missing fundamental keys %s", e)
                 continue
                 
-        logger.info(f"DouyinFetcher: Successfully processed {len(results)} valid video records.")
+        logger.info("DouyinFetcher: Successfully processed %s valid video records.", len(results))
         return results
 
-    def refresh_video_url(self, douyin_id: str, accounts: list) -> dict:
+    async def refresh_video_url(self, douyin_id: str, accounts: list) -> Optional[dict]:
         """
         Re-fetches the video list from the API and finds a matching video_id 
         to obtain a fresh CDN URL with valid time-based tokens.
@@ -199,19 +212,18 @@ class DouyinFetcher:
                 # Search up to 3 pages to find the video (may not be in the first 10/13 results)
                 cursor = 0
                 for _page in range(3):
-                    posts, next_cursor, has_more = self.fetch_user_posts(account_url, max_cursor=cursor)
+                    posts, next_cursor, has_more = await self.fetch_user_posts(account_url, max_cursor=cursor)
                     for post in posts:
-                        if post.get("douyin_id") == douyin_id:
+                        if post.douyin_id == douyin_id:
                             return {
-                                "video_url": post.get("video_url", ""),
-                                "cover_url": post.get("cover_url", "")
+                                "video_url": post.video_url,
+                                "cover_url": post.cover_url
                             }
                     if not has_more or next_cursor == 0:
                         break
                     cursor = next_cursor
             except Exception as e:
-                logger.warning(f"DouyinFetcher: Error refreshing URL for {douyin_id}: {e}")
+                logger.warning("DouyinFetcher: Error refreshing URL for %s: %s", douyin_id, e)
                 continue
         
         return None
-

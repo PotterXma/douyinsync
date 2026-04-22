@@ -1,0 +1,1936 @@
+diff --git a/main.py b/main.py
+index 9c7d9c9..64b5114 100644
+--- a/main.py
++++ b/main.py
+@@ -1,15 +1,22 @@
+ import sys
+-import time
+ import threading
++import queue
++
++# ── Logging MUST be configured before any other module import ──────────────
++from utils.logger import setup_logging
++setup_logging()
++# ───────────────────────────────────────────────────────────────────────────
+ 
+ from modules.logger import logger
+ from modules.database import db
+ from modules.config_manager import config
+-from modules.tray_app import TrayController
++from ui.tray_icon import TrayApp
++from utils.models import AppEvent
+ from modules.scheduler import PipelineCoordinator
+ 
+ 
+-def background_daemon(stop_event: threading.Event, coordinator: PipelineCoordinator):
++
++def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator):
+     """The central data pipeline background loop."""
+     logger.info("Background daemon pipeline starting.")
+     
+@@ -18,15 +25,24 @@ def background_daemon(stop_event: threading.Event, coordinator: PipelineCoordina
+         mode = conn.cursor().execute("PRAGMA journal_mode;").fetchone()[0]
+     
+     douyin_accounts = config.get("douyin_accounts", [])
+-    logger.info(f"Data Pipeline fully initialized. DB Mode: {mode} | Discovered Accounts: {len(douyin_accounts)}")
++    logger.info("Data Pipeline fully initialized. DB Mode: %s | Discovered Accounts: %s", mode, len(douyin_accounts))
+     
+     coordinator.start()
+     
+-    # Infinite loop isolated from Windows UI lock. Runs until Exit clicks Set stop_event.
+-    while not stop_event.is_set():
+-        # Fast 1s polling granularity guarantees fast teardown responses.
+-        stop_event.wait(timeout=1.0)
+-        
++    # Infinite loop isolated from Windows UI lock.
++    while True:
++        try:
++            event = event_queue.get(timeout=1.0)
++            if event.command == "EXIT":
++                logger.info("Received EXIT command. Shutting down daemon.")
++                break
++            elif event.command == "RELOAD_CONFIG":
++                logger.info("Reloading config.")
++            elif event.command == "OPEN_DASHBOARD":
++                logger.info("Open dashboard command received.")
++        except queue.Empty:
++            pass
++            
+     coordinator.shutdown()
+     logger.info("Background daemon loop completed gracefully.")
+ 
+@@ -35,7 +51,7 @@ def main():
+     logger.info("Initializing DouyinSync Launch sequence...")
+     
+     # 1. Establish the Thread-Safe communication switch
+-    stop_event = threading.Event()
++    event_queue = queue.Queue()
+     
+     # 2. Create the shared coordinator (single instance for the entire app)
+     coordinator = PipelineCoordinator()
+@@ -43,7 +59,7 @@ def main():
+     # 3. Extract and launch core blocking routines into an isolated non-UI daemon thread
+     daemon_thread = threading.Thread(
+         target=background_daemon, 
+-        args=(stop_event, coordinator), 
++        args=(event_queue, coordinator), 
+         daemon=True,
+         name="DataPipelineWorker"
+     )
+@@ -51,13 +67,12 @@ def main():
+     
+     # 4. Hijack Main Thread rendering rights for Microsoft Windows specific UI safety.
+     try:
+-        tray = TrayController(stop_event)
+-        tray.coordinator = coordinator  # Wire up for in-process manual_run
++        tray = TrayApp(event_queue)
+         # `.run()` acts as blocking loop internally until user clicks 'Exit'
+         tray.run() 
+     except KeyboardInterrupt:
+         logger.warning("Caught keyboard interrupt. Signaling shutdown flag to workers.")
+-        stop_event.set()
++        event_queue.put(AppEvent(command="EXIT"))
+         
+     # Wait maximum 3s for background thread loop to safely close files/DB connection
+     daemon_thread.join(timeout=3.0)
+diff --git a/modules/config_manager.py b/modules/config_manager.py
+index 7ef34a9..3552f6b 100644
+--- a/modules/config_manager.py
++++ b/modules/config_manager.py
+@@ -53,17 +53,17 @@ class ConfigManager:
+                 
+             path_obj = Path(self.config_file)
+             if not path_obj.is_file():
+-                logger.critical(f"Configuration file missing or not a file at {self.config_file}")
++                logger.critical("Configuration file missing or not a file at %s", self.config_file)
+                 raise ConfigNotFoundError(f"Configuration file not found at {self.config_file}")
+             
+             try:
+                 with open(self.config_file, "r", encoding="utf-8") as f:
+                     data = json.load(f)
+             except OSError as e:
+-                logger.critical(f"OS/Permission error reading config file: {e}")
++                logger.critical("OS/Permission error reading config file: %s", e)
+                 raise ConfigParseError(f"File read error: {e}")
+             except json.JSONDecodeError as e:
+-                logger.critical(f"JSON Parse error in config file: {e}")
++                logger.critical("JSON Parse error in config file: %s", e)
+                 raise ConfigParseError(f"Failed to parse JSON configuration: {e}")
+ 
+             if not isinstance(data, dict):
+diff --git a/modules/database.py b/modules/database.py
+index 9762bca..0ae7976 100644
+--- a/modules/database.py
++++ b/modules/database.py
+@@ -238,3 +238,15 @@ class VideoDAO:
+         now = int(time.time())
+         with db.get_connection() as conn:
+             conn.execute(sql, (video_url, cover_url, now, douyin_id))
++
++    @staticmethod
++    def get_pipeline_stats() -> dict[str, int]:
++        """Retrieves aggregated statistics of videos grouped by current status using a safe polling query."""
++        sql = "SELECT status, COUNT(*) as count FROM videos GROUP BY status"
++        stats = {}
++        with db.get_connection() as conn:
++            cursor = conn.cursor()
++            for row in cursor.execute(sql):
++                stats[row['status']] = row['count']
++        return stats
++
+diff --git a/modules/douyin_fetcher.py b/modules/douyin_fetcher.py
+index d5f1372..e0ec17c 100644
+--- a/modules/douyin_fetcher.py
++++ b/modules/douyin_fetcher.py
+@@ -1,9 +1,13 @@
+-import requests
++import httpx
+ import json
+ from urllib.parse import urlparse, urlencode, quote
++from typing import List, Tuple, Optional
++
+ from modules.logger import logger
+ from modules.config_manager import config
+ from modules.abogus import ABogus, USERAGENT
++from utils.models import VideoRecord
++from utils.decorators import auto_retry, circuit_breaker
+ 
+ class DouyinFetcher:
+     def __init__(self):
+@@ -14,6 +18,13 @@ class DouyinFetcher:
+             "Accept": "application/json, text/plain, */*",
+             "Accept-Encoding": "gzip, deflate"
+         }
++        self.client = httpx.AsyncClient(timeout=15.0)
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc_val, exc_tb):
++        await self.client.aclose()
+ 
+     def _get_cookie_header(self):
+         cookie = str(config.get("douyin_cookie", "")).strip()
+@@ -21,19 +32,21 @@ class DouyinFetcher:
+             return {"Cookie": cookie}
+         return {}
+ 
+-    def fetch_user_posts(self, user_url: str, max_cursor: int = 0) -> tuple:
++    @auto_retry(max_retries=3, exceptions=(httpx.RequestError,))
++    @circuit_breaker(trip_on=(httpx.HTTPStatusError,))
++    async def fetch_user_posts(self, user_url: str, max_cursor: int = 0) -> Tuple[List[VideoRecord], int, bool]:
+         """
+         Parses profile to get videos with pagination support.
+         Returns tuple of (posts_list, next_cursor, has_more).
+         """
+-        logger.info(f"DouyinFetcher: Initiating scrape for URL -> {user_url} (cursor={max_cursor})")
++        logger.info("DouyinFetcher: Initiating scrape for URL -> %s (cursor=%s)", user_url, max_cursor)
+         
+         current_headers = self.headers.copy()
+         current_headers.update(self._get_cookie_header())
+         
+         sec_user_id = self._extract_sec_user_id(user_url)
+         if not sec_user_id:
+-            logger.error(f"DouyinFetcher: Could not extract valid sec_user_id from {user_url}")
++            logger.error("DouyinFetcher: Could not extract valid sec_user_id from %s", user_url)
+             return [], 0, False
+             
+         # Use exact endpoint mapping
+@@ -90,7 +103,7 @@ class DouyinFetcher:
+         
+         try:
+             # We enforce direct domestic connection (No Proxy) to hit Douyin smoothly usually.
+-            response = requests.get(api_url, headers=current_headers, timeout=15.0)
++            response = await self.client.get(api_url, headers=current_headers)
+             response.raise_for_status()
+             data = response.json()
+             
+@@ -99,11 +112,11 @@ class DouyinFetcher:
+             has_more = bool(data.get("has_more", 0))
+             
+             return posts, next_cursor, has_more
+-        except requests.RequestException as e:
+-            logger.error(f"DouyinFetcher: Network error during fetch. {e}")
++        except httpx.RequestError as e:
++            logger.error("DouyinFetcher: Network error during fetch. %s", e)
+             return [], 0, False
+         except Exception as e:
+-            logger.error(f"DouyinFetcher: Exception during fetch payload parsing: {e}")
++            logger.error("DouyinFetcher: Exception during fetch payload parsing: %s", e)
+             return [], 0, False
+ 
+     def _extract_sec_user_id(self, url: str) -> str:
+@@ -116,12 +129,12 @@ class DouyinFetcher:
+                 if idx + 1 < len(parts):
+                     return parts[idx + 1]
+         except Exception as e:
+-            logger.debug(f"Failed to URL-parse {url}: {e}")
++            logger.debug("Failed to URL-parse %s: %s", url, e)
+         return ""
+ 
+-    def _parse_video_list(self, json_data: dict) -> list:
+-        """Safely distills Douyin JSON into generic pipeline dict metadata."""
+-        results = []
++    def _parse_video_list(self, json_data: dict) -> List[VideoRecord]:
++        """Safely distills Douyin JSON into strongly-typed VideoRecord instances."""
++        results: List[VideoRecord] = []
+         if not isinstance(json_data, dict):
+             logger.warning("DouyinFetcher: Invalid JSON payload root format.")
+             return results
+@@ -134,7 +147,7 @@ class DouyinFetcher:
+         for item in aweme_list:
+             # Filter Layer: Discard Tuwen (Image posts) protecting downstream YouTube Uploader
+             if item.get("images") is not None or item.get("aweme_type") == 68:
+-                logger.debug(f"DouyinFetcher: Filtering out unsupported Image-Post. ID: {item.get('aweme_id')}")
++                logger.debug("DouyinFetcher: Filtering out unsupported Image-Post. ID: %s", item.get('aweme_id'))
+                 continue
+                 
+             try:
+@@ -163,21 +176,21 @@ class DouyinFetcher:
+                 cover_addr = video_info.get("cover", {}).get("url_list", [])
+                 cover_url = cover_addr[0] if cover_addr else ""
+                 
+-                results.append({
+-                    "douyin_id": str(douyin_id),
+-                    "title": title[:300], # Soft fail-safe limit
+-                    "description": title,
+-                    "video_url": video_url,
+-                    "cover_url": cover_url
+-                })
++                results.append(VideoRecord(
++                    douyin_id=str(douyin_id),
++                    title=title[:300],       # Soft fail-safe limit
++                    description=title,
++                    video_url=video_url,
++                    cover_url=cover_url,
++                ))
+             except KeyError as e:
+-                logger.debug(f"DouyinFetcher: Skipped item missing fundamental keys {e}")
++                logger.debug("DouyinFetcher: Skipped item missing fundamental keys %s", e)
+                 continue
+                 
+-        logger.info(f"DouyinFetcher: Successfully processed {len(results)} valid video records.")
++        logger.info("DouyinFetcher: Successfully processed %s valid video records.", len(results))
+         return results
+ 
+-    def refresh_video_url(self, douyin_id: str, accounts: list) -> dict:
++    async def refresh_video_url(self, douyin_id: str, accounts: list) -> Optional[dict]:
+         """
+         Re-fetches the video list from the API and finds a matching video_id 
+         to obtain a fresh CDN URL with valid time-based tokens.
+@@ -199,19 +212,18 @@ class DouyinFetcher:
+                 # Search up to 3 pages to find the video (may not be in the first 10/13 results)
+                 cursor = 0
+                 for _page in range(3):
+-                    posts, next_cursor, has_more = self.fetch_user_posts(account_url, max_cursor=cursor)
++                    posts, next_cursor, has_more = await self.fetch_user_posts(account_url, max_cursor=cursor)
+                     for post in posts:
+-                        if post.get("douyin_id") == douyin_id:
++                        if post.douyin_id == douyin_id:
+                             return {
+-                                "video_url": post.get("video_url", ""),
+-                                "cover_url": post.get("cover_url", "")
++                                "video_url": post.video_url,
++                                "cover_url": post.cover_url
+                             }
+                     if not has_more or next_cursor == 0:
+                         break
+                     cursor = next_cursor
+             except Exception as e:
+-                logger.warning(f"DouyinFetcher: Error refreshing URL for {douyin_id}: {e}")
++                logger.warning("DouyinFetcher: Error refreshing URL for %s: %s", douyin_id, e)
+                 continue
+         
+         return None
+-
+diff --git a/modules/downloader.py b/modules/downloader.py
+index 856518b..cb2c555 100644
+--- a/modules/downloader.py
++++ b/modules/downloader.py
+@@ -1,14 +1,17 @@
+-import requests
++import os
++import sys
++import time
++import asyncio
+ from pathlib import Path
+-from PIL import Image
+ from datetime import datetime
+ 
++import httpx
++import aiofiles
++from PIL import Image
++
+ from modules.logger import logger
+ from modules.abogus import USERAGENT
+-
+-import os
+-import sys
+-import time
++from modules.config_manager import config
+ 
+ if getattr(sys, 'frozen', False):
+     PROJECT_ROOT = Path(sys.executable).parent
+@@ -22,11 +25,11 @@ class Downloader:
+         # Assure folder root exists
+         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ 
+-    def download_media(self, douyin_id: str, video_url: str, cover_url: str) -> dict:
++    async def download_media(self, douyin_id: str, video_url: str, cover_url: str) -> dict:
+         """
+         Coordinates dual downloading of MP4 and Image.
+-        Memory-efficient: uses iterative streaming.
+-        Format Compatibility: automatically recodes WebP into standard JPEG.
++        Memory-efficient: uses async iterative streaming via httpx and aiofiles.
++        Format Compatibility: automatically recodes WebP into standard JPEG asynchronously via thread pool.
+         Returns populated dict of local paths on success, or None on critical failure.
+         """
+         # Bucket by date to prevent directory file bloat over months
+@@ -37,168 +40,163 @@ class Downloader:
+         cover_path_webp = date_folder / f"{douyin_id}.webp"
+         cover_path_jpg = date_folder / f"{douyin_id}.jpg"
+         
+-        logger.info(f"Downloader: Commencing Chunked-Stream fetch for Video ID {douyin_id}...")
++        logger.info("Downloader: Commencing Chunked-Stream fetch for Video ID %s...", douyin_id)
+         
+         try:
+             # Task 1: Video Payload
+-            if not self._download_file(video_url, video_path, chunk_size=1024*1024):
+-                logger.error(f"Downloader: Video MP4 fetch failed for {douyin_id}. Aborting task.")
++            if not await self._download_file(video_url, video_path, chunk_size=1048576):
++                logger.error("Downloader: Video MP4 fetch failed for %s. Aborting task.", douyin_id)
+                 if video_path.exists():
+                     video_path.unlink(missing_ok=True)
+                 return None
+                 
+             # Task 2: Cover Art Payload
+             ocr_text = ""
+-            if cover_url and self._download_file(cover_url, cover_path_webp):
++            if cover_url and await self._download_file(cover_url, cover_path_webp):
+                 # Transformation hook
+                 try:
+-                    from PIL import ImageFilter
+-                    with Image.open(cover_path_webp) as img:
+-                        # Ensures transparency is discarded properly (JPG does not support alpha)
+-                        rgb_img = img.convert('RGB')
+-                        # Save Original
+-                        rgb_img.save(cover_path_jpg, "JPEG", quality=95)
+-                        
+-                        # --- OCR Extraction ---
+-                        try:
+-                            from modules.win_ocr import get_text_from_image
+-                            # Extract baked text from original cover
+-                            extracted = get_text_from_image(str(cover_path_jpg))
+-                            if extracted:
+-                                ocr_text = " ".join(extracted.split())
+-                                logger.info(f"Downloader: OCR Extracted Cover Text: {ocr_text}")
+-                        except Exception as ocr_e:
+-                            logger.warning(f"Downloader: Windows OCR Module failed or missing: {ocr_e}")
+-                            
+-                        # --- YouTube 16:9 Thumbnail Generation using Template ---
+-                        # Look for og.jpg template
+-                        og_template_path = None
+-                        candidates = [
+-                            PROJECT_ROOT / "og.jpg",
+-                            PROJECT_ROOT.parent / "og.jpg",
+-                        ]
+-                        for c in candidates:
+-                            if c.exists():
+-                                og_template_path = c
+-                                break
+-                                
+-                        if og_template_path:
+-                            try:
+-                                bg_img = Image.open(og_template_path).convert('RGB')
+-                                target_w, target_h = bg_img.size
+-                            except Exception as e:
+-                                logger.error(f"Downloader: Could NOT load og.jpg template: {e}")
+-                                bg_img = Image.new('RGB', (1280, 720), (0, 0, 0))
+-                                target_w, target_h = 1280, 720
+-                        else:
+-                            # Fallback if og.jpg not found - blank black background
+-                            bg_img = Image.new('RGB', (1280, 720), (0, 0, 0))
+-                            target_w, target_h = 1280, 720
+-                            logger.warning("Downloader: og.jpg template not found! Using black background.")
+-                        
+-                        # --- Overlay OCR Text ---
+-                        if ocr_text:
+-                            try:
+-                                from PIL import ImageDraw, ImageFont
+-                                import platform
+-                                draw = ImageDraw.Draw(bg_img)
+-                                
+-                                # Font discovery
+-                                font_path = ""
+-                                if platform.system() == "Windows":
+-                                    fallback_fonts = [
+-                                        "C:\\Windows\\Fonts\\simkai.ttf",
+-                                        "C:\\Windows\\Fonts\\msyhbd.ttc",
+-                                        "C:\\Windows\\Fonts\\msyh.ttc",
+-                                        "C:\\Windows\\Fonts\\simhei.ttf"
+-                                    ]
+-                                    for f in fallback_fonts:
+-                                        if os.path.exists(f):
+-                                            font_path = f
+-                                            break
+-                                        
+-                                if font_path:
+-                                    font = ImageFont.truetype(font_path, 80) # Increased font size for template
+-                                else:
+-                                    font = ImageFont.load_default()
+-                                    
+-                                # Split long title into multiple lines if needed
+-                                max_len = 16
+-                                lines = [ocr_text[i:i+max_len] for i in range(0, len(ocr_text), max_len)][:2]
+-                                
+-                                # Dynamic vertical spacing based on exact font envelope
+-                                line_spacing = 20
+-                                total_height = 0
+-                                line_heights = []
+-                                
+-                                for line in lines:
+-                                    bbox = draw.textbbox((0, 0), line, font=font)
+-                                    h = bbox[3] - bbox[1]
+-                                    line_heights.append(h)
+-                                    total_height += h + line_spacing
+-                                    
+-                                if lines:
+-                                    total_height -= line_spacing # Remove trailing space
+-                                    
+-                                start_y = (target_h - total_height) / 2
+-                                current_y = start_y
+-                                
+-                                for idx, line in enumerate(lines):
+-                                    # Left alignment, starting around 10%~15% from the left edge
+-                                    text_x = 180 
+-                                    text_y = current_y
+-                                    
+-                                    # Draw black border shadow for readability
+-                                    shadow_offset = 4
+-                                    draw.text((text_x + shadow_offset, text_y + shadow_offset), line, font=font, fill=(0, 0, 0))
+-                                    # Draw striking yellow/white text
+-                                    draw.text((text_x, text_y), line, font=font, fill=(255, 235, 59))
+-                                    
+-                                    current_y += line_heights[idx] + line_spacing
+-                            except Exception as text_err:
+-                                logger.warning(f"Downloader: Could not draw OCR text overlay onto cover: {text_err}")
+-                                
+-                        yt_cover_path = date_folder / f"{douyin_id}_yt.jpg"
+-                        bg_img.save(yt_cover_path, "JPEG", quality=95)
+-                        
+-                        # Set the standard cover to the Youtube format
+-                        cover_path_jpg = yt_cover_path
+-                        logger.debug(f"Downloader: Success formatting YouTube Cover with Template + Text Overlay - {cover_path_jpg}")
+-                    
+-                    # Cleanup staging webp securely
+-                    if cover_path_webp.exists():
+-                        cover_path_webp.unlink()
++                    ocr_text, final_cover_jpg = await asyncio.to_thread(
++                        self._process_image_sync,
++                        str(cover_path_webp),
++                        str(cover_path_jpg),
++                        douyin_id,
++                        str(date_folder)
++                    )
++                    cover_path_jpg = Path(final_cover_jpg)
+                 except Exception as e:
+-                    logger.error(f"Downloader: Pillow WebP->JPEG/YouTube transformation failed: {e}")
++                    logger.error("Downloader: Pillow WebP->JPEG/YouTube transformation failed: %s", e)
+                     # Desperate fallback - return webp string
+                     cover_path_jpg = cover_path_webp
+             else:
+-                logger.warning(f"Downloader: Cover image fetch failed/missing for {douyin_id}. Proceeding blindly.")
++                logger.warning("Downloader: Cover image fetch failed/missing for %s. Proceeding blindly.", douyin_id)
+                 cover_path_jpg = ""
+                 
+-            logger.info(f"Downloader: Securely landed 100% data locally for {douyin_id}.")
++            logger.info("Downloader: Securely landed 100%% data locally for %s.", douyin_id)
+             return {
+                 "local_video_path": str(video_path),
+-                "local_cover_path": str(cover_path_jpg),
++                "local_cover_path": str(cover_path_jpg) if cover_path_jpg else "",
+                 "ocr_text": ocr_text
+             }
+             
+         except Exception as e:
+-            logger.error(f"Downloader: Fatal disruption sequence inside chunk loop {douyin_id}: {e}")
++            logger.error("Downloader: Fatal disruption sequence inside chunk loop %s: %s", douyin_id, e)
+             # Ensure no corrupted half-files are left hanging
+             if video_path.exists():
+                 video_path.unlink(missing_ok=True)
+             return None
+ 
+-    def _download_file(self, url: str, dest_path: Path, chunk_size=8192) -> bool:
+-        """Hardware-safe file dumping method. Blocks memory balloons for 500MB+ files."""
+-        from modules.config_manager import config
++    def _process_image_sync(self, cover_path_webp: str, cover_path_jpg: str, douyin_id: str, date_folder_str: str):
++        """Blocking Image processing function intended to run in a thread."""
++        date_folder = Path(date_folder_str)
++        ocr_text = ""
++        with Image.open(cover_path_webp) as img:
++            rgb_img = img.convert('RGB')
++            rgb_img.save(cover_path_jpg, "JPEG", quality=95)
++            
++        # --- OCR Extraction ---
++        try:
++            from modules.win_ocr import get_text_from_image
++            extracted = get_text_from_image(str(cover_path_jpg))
++            if extracted:
++                ocr_text = " ".join(extracted.split())
++                logger.info("Downloader: OCR Extracted Cover Text: %s", ocr_text)
++        except Exception as ocr_e:
++            logger.warning("Downloader: Windows OCR Module failed or missing: %s", ocr_e)
++            
++        # --- YouTube 16:9 Thumbnail Generation using Template ---
++        og_template_path = None
++        candidates = [
++            PROJECT_ROOT / "og.jpg",
++            PROJECT_ROOT.parent / "og.jpg",
++        ]
++        for c in candidates:
++            if c.exists():
++                og_template_path = c
++                break
++                
++        if og_template_path:
++            try:
++                bg_img = Image.open(og_template_path).convert('RGB')
++                target_w, target_h = bg_img.size
++            except Exception as e:
++                logger.error("Downloader: Could NOT load og.jpg template: %s", e)
++                bg_img = Image.new('RGB', (1280, 720), (0, 0, 0))
++                target_w, target_h = 1280, 720
++        else:
++            bg_img = Image.new('RGB', (1280, 720), (0, 0, 0))
++            target_w, target_h = 1280, 720
++        
++        # --- Overlay OCR Text ---
++        if ocr_text:
++            try:
++                from PIL import ImageDraw, ImageFont
++                import platform
++                draw = ImageDraw.Draw(bg_img)
++                
++                font_path = ""
++                if platform.system() == "Windows":
++                    fallback_fonts = [
++                        "C:\\Windows\\Fonts\\simkai.ttf",
++                        "C:\\Windows\\Fonts\\msyhbd.ttc",
++                        "C:\\Windows\\Fonts\\msyh.ttc",
++                        "C:\\Windows\\Fonts\\simhei.ttf"
++                    ]
++                    for f in fallback_fonts:
++                        if os.path.exists(f):
++                            font_path = f
++                            break
++                        
++                if font_path:
++                    font = ImageFont.truetype(font_path, 80)
++                else:
++                    font = ImageFont.load_default()
++                    
++                max_len = 16
++                lines = [ocr_text[i:i+max_len] for i in range(0, len(ocr_text), max_len)][:2]
++                
++                line_spacing = 20
++                total_height = 0
++                line_heights = []
++                
++                for line in lines:
++                    bbox = draw.textbbox((0, 0), line, font=font)
++                    h = bbox[3] - bbox[1]
++                    line_heights.append(h)
++                    total_height += h + line_spacing
++                    
++                if lines:
++                    total_height -= line_spacing
++                    
++                start_y = (target_h - total_height) / 2
++                current_y = start_y
++                
++                for idx, line in enumerate(lines):
++                    text_x = 180 
++                    text_y = current_y
++                    
++                    shadow_offset = 4
++                    draw.text((text_x + shadow_offset, text_y + shadow_offset), line, font=font, fill=(0, 0, 0))
++                    draw.text((text_x, text_y), line, font=font, fill=(255, 235, 59))
++                    
++                    current_y += line_heights[idx] + line_spacing
++            except Exception as text_err:
++                logger.warning("Downloader: Could not draw OCR text overlay onto cover: %s", text_err)
++                
++        yt_cover_path = date_folder / f"{douyin_id}_yt.jpg"
++        bg_img.save(yt_cover_path, "JPEG", quality=95)
++        
++        if Path(cover_path_webp).exists():
++            Path(cover_path_webp).unlink()
++            
++        return ocr_text, str(yt_cover_path)
++
++    async def _download_file(self, url: str, dest_path: Path, chunk_size=1048576) -> bool:
++        """Hardware-safe file dumping method. Blocks memory balloons for massive MP4 streams."""
+         headers = {
+             "User-Agent": USERAGENT,
+             "Referer": "https://www.douyin.com/"
+         }
+         
+-        # Inject Douyin cookie for CDN authentication (prevents 403 Forbidden)
+         cookie = str(config.get("douyin_cookie", "")).strip()
+         if cookie:
+             headers["Cookie"] = cookie
+@@ -209,87 +207,82 @@ class Downloader:
+         
+         for attempt in range(max_retries):
+             try:
+-                # timeout=(connect_timeout, read_timeout)
+-                # connect: 10s to establish connection
+-                # read: 120s max wait between chunks (large videos need more time)
+                 req_headers = headers.copy()
+                 if downloaded > 0:
+                     req_headers["Range"] = f"bytes={downloaded}-"
+-                    logger.info(f"Downloader: Resuming {dest_path.name} from byte {downloaded}...")
++                    logger.info("Downloader: Resuming %s from byte %s...", dest_path.name, downloaded)
+                 else:
+-                    # Clean any existing file on first attempt
+                     if dest_path.exists():
+                         dest_path.unlink()
+                         
+-                with requests.get(url, headers=req_headers, stream=True, timeout=(10, 120)) as r:
+-                    r.raise_for_status()
+-                    
+-                    # 206 Partial Content: server accepted Range header, we can resume
+-                    if r.status_code == 206:
+-                        mode = "ab"
+-                        # Parse total size from Content-Range: bytes X-Y/TOTAL
+-                        content_range = r.headers.get('content-range', '')
+-                        if '/' in content_range:
+-                            try:
+-                                total_size = int(content_range.split('/')[-1])
+-                            except (ValueError, IndexError):
++                timeout = httpx.Timeout(10.0, read=120.0)
++                async with httpx.AsyncClient(timeout=timeout) as client:
++                    async with client.stream("GET", url, headers=req_headers) as r:
++                        r.raise_for_status()
++                        
++                        if r.status_code == 206:
++                            mode = "ab"
++                            content_range = r.headers.get('content-range', '')
++                            if '/' in content_range:
++                                try:
++                                    total_size = int(content_range.split('/')[-1])
++                                except (ValueError, IndexError):
++                                    total_size = downloaded + int(r.headers.get('content-length', 0))
++                            else:
+                                 total_size = downloaded + int(r.headers.get('content-length', 0))
+                         else:
+-                            total_size = downloaded + int(r.headers.get('content-length', 0))
+-                    else:
+-                        # Server returned 200: doesn't support Range -> delete any corrupt partial file first
+-                        if dest_path.exists():
+-                            dest_path.unlink()
+-                        mode = "wb"
+-                        downloaded = 0
+-                        total_size = int(r.headers.get('content-length', 0))
++                            if dest_path.exists():
++                                dest_path.unlink()
++                            mode = "wb"
++                            downloaded = 0
++                            total_size = int(r.headers.get('content-length', 0))
++                            
++                        last_log_time = time.time()
++                        async with aiofiles.open(dest_path, mode) as f:
++                            async for chunk in r.aiter_bytes(chunk_size=chunk_size):
++                                if chunk:
++                                    await f.write(chunk)
++                                    downloaded += len(chunk)
++                                    
++                                    if total_size > 0 and time.time() - last_log_time >= 5.0:
++                                        percent = (downloaded / total_size) * 100
++                                        logger.info("Downloader: %s 下载进度 %.1f%% (%.1fMB/%.1fMB)", dest_path.name, percent, downloaded/1024/1024, total_size/1024/1024)
++                                        last_log_time = time.time()
+                         
+-                    last_log_time = time.time()
+-                    with open(dest_path, mode) as f:
+-                        for chunk in r.iter_content(chunk_size=chunk_size):
+-                            if chunk:
+-                                f.write(chunk)
+-                                downloaded += len(chunk)
+-                                
+-                                # Print download progress every 5 seconds
+-                                if total_size > 0 and time.time() - last_log_time >= 5.0:
+-                                    percent = (downloaded / total_size) * 100
+-                                    logger.info(f"Downloader: {dest_path.name} 下载进度 {percent:.1f}% ({downloaded/1024/1024:.1f}MB/{total_size/1024/1024:.1f}MB)")
+-                                    last_log_time = time.time()
++                        if total_size > 0 and downloaded < total_size:
++                            logger.error("Downloader: Incomplete download for %s: %s/%s bytes", dest_path.name, downloaded, total_size)
++                            if attempt < max_retries - 1:
++                                logger.info("Downloader: Retrying download (%s/%s)...", attempt + 1, max_retries)
++                                await asyncio.sleep(2)
++                                continue
++                            return False
++                            
++                        logger.info("Downloader: Finished streaming %s (%.1f MB)", dest_path.name, downloaded / 1024 / 1024)
++                    return True
+                     
+-                    if total_size > 0 and downloaded < total_size:
+-                        logger.error(f"Downloader: Incomplete download for {dest_path.name}: {downloaded}/{total_size} bytes")
+-                        if attempt < max_retries - 1:
+-                            logger.info(f"Downloader: Retrying download ({attempt + 1}/{max_retries})...")
+-                            time.sleep(2)
+-                            continue
++            except httpx.HTTPError as e:
++                response = getattr(e, "response", None)
++                if response:
++                    if response.status_code == 416 and downloaded > 0 and downloaded == total_size:
++                         logger.info("Downloader: Server reported 416, but local size equals total_size. Considering file complete.")
++                         return True
++                         
++                    if response.status_code == 403:
++                        logger.error("Downloader: 403 Forbidden. The CDN URL has expired and cannot be retried. %s", e)
+                         return False
+                         
+-                    logger.info(f"Downloader: Finished streaming {dest_path.name} ({downloaded / 1024 / 1024:.1f} MB)")
+-                return True
+-                
+-            except requests.exceptions.HTTPError as e:
+-                # If we get a 416 Range Not Satisfiable, maybe the file changed or is fully downloaded but we failed to recognize it.
+-                if e.response.status_code == 416 and downloaded > 0 and downloaded == total_size:
+-                     logger.info(f"Downloader: Server reported 416, but local size equals total_size. Considering file complete.")
+-                     return True
+-                     
+-                if e.response.status_code == 403:
+-                    logger.error(f"Downloader: 403 Forbidden. The CDN URL has expired and cannot be retried. {e}")
+-                    return False
+-                    
+-                logger.error(f"Downloader: HTTP Error {e.response.status_code}: {e}")
++                logger.error("Downloader: HTTP Error %s", e)
+                 if attempt < max_retries - 1:
+-                    logger.info(f"Downloader: Retrying download ({attempt + 1}/{max_retries})...")
+-                    time.sleep(2)
++                    logger.info("Downloader: Retrying download (%s/%s)...", attempt + 1, max_retries)
++                    await asyncio.sleep(2)
+                     continue
+                 return False
+                 
+             except Exception as e:
+-                logger.error(f"Downloader: Stream HTTP disconnect mapping URL {url[:80]}... : {e}")
++                logger.error("Downloader: Stream disconnect mapping URL %s... : %s", url[:80], e)
+                 if attempt < max_retries - 1:
+-                    logger.info(f"Downloader: Retrying download ({attempt + 1}/{max_retries})...")
+-                    time.sleep(2)
++                    logger.info("Downloader: Retrying download (%s/%s)...", attempt + 1, max_retries)
++                    await asyncio.sleep(2)
+                     continue
+                 return False
+                 
+diff --git a/modules/logger.py b/modules/logger.py
+index d38f2e1..241da87 100644
+--- a/modules/logger.py
++++ b/modules/logger.py
+@@ -1,64 +1,5 @@
+ import logging
+-import os
+-import re
+-from logging.handlers import TimedRotatingFileHandler
+-import sys
+-from pathlib import Path
+ 
+-if getattr(sys, 'frozen', False):
+-    PROJECT_ROOT = Path(sys.executable).parent
+-else:
+-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+-
+-# Setup logs directory
+-LOG_DIR = PROJECT_ROOT / "logs"
+-LOG_DIR.mkdir(exist_ok=True, parents=True)
+-LOG_FILE = LOG_DIR / "douyinsync.log"
+-
+-class SecretSanitizer(logging.Filter):
+-    """
+-    Dynamically redacts sensitive keys (e.g. sessionid, access_token) from logs.
+-    """
+-    def filter(self, record):
+-        msg = str(record.msg)
+-        # Redact common token patterns: matches `sessionid=VALUE` or `access_token=VALUE`
+-        # and replaces VALUE with [REDACTED]
+-        record.msg = re.sub(r'(sessionid=|access_token=|a_bogus=)[^&\s]+', r'\1[REDACTED]', msg, flags=re.IGNORECASE)
+-        return True
+-
+-def setup_logger(name="DouyinSync"):
+-    logger = logging.getLogger(name)
+-    
+-    # Only configure if not already configured to prevent duplication
+-    if not logger.handlers:
+-        logger.setLevel(logging.DEBUG)
+-        
+-        # Formatter
+-        formatter = logging.Formatter(
+-            '%(asctime)s | %(name)s | %(levelname)s | %(message)s'
+-        )
+-        
+-        # Rotating File Handler (Daily, max 5 backups)
+-        file_handler = TimedRotatingFileHandler(
+-            filename=LOG_FILE,
+-            when="midnight",
+-            interval=1,
+-            backupCount=5,
+-            encoding='utf-8'
+-        )
+-        file_handler.setLevel(logging.DEBUG)
+-        file_handler.setFormatter(formatter)
+-        file_handler.addFilter(SecretSanitizer())
+-        
+-        # Console Handler
+-        console_handler = logging.StreamHandler()
+-        console_handler.setLevel(logging.INFO)
+-        console_handler.setFormatter(formatter)
+-        console_handler.addFilter(SecretSanitizer())
+-        
+-        logger.addHandler(file_handler)
+-        logger.addHandler(console_handler)
+-        
+-    return logger
+-
+-logger = setup_logger()
++# Proxy the logger to the globally configured douyinsync logger
++# The actual setup/handlers are injected by utils/logger.py in main.py
++logger = logging.getLogger("douyinsync")
+diff --git a/modules/notifier.py b/modules/notifier.py
+index 826e99b..d9a7abb 100644
+--- a/modules/notifier.py
++++ b/modules/notifier.py
+@@ -1,12 +1,13 @@
+ import requests
++import datetime
+ from urllib.parse import quote
+ from modules.logger import logger
+ from modules.config_manager import config
+ 
+ class BarkNotifier:
+     def __init__(self):
+-        # Just validate the initial config and log status. 
+-        # Actual connection params are read at push() time to support hot-reload.
++        self._daily_upload_count: int = 0
++        self._summary_date: str = datetime.date.today().isoformat()
+         self._log_init_status()
+ 
+     def _log_init_status(self):
+@@ -16,7 +17,7 @@ class BarkNotifier:
+         bark_url = str(config.get("bark_url", "")).strip('/')
+         
+         if (server and key) or (bark_url and bark_url.startswith("http")):
+-            logger.info(f"BarkNotifier: Initialized successfully. Server: {server or bark_url}")
++            logger.info("BarkNotifier: Initialized successfully. Server: %s", server or bark_url)
+         else:
+             logger.warning("BarkNotifier: Disabled — missing bark_server/bark_key in config.json")
+ 
+@@ -42,7 +43,7 @@ class BarkNotifier:
+         if not bark_url:
+             return
+ 
+-        logger.info(f"BarkNotifier: Emitting Mobile Broadcast [{title}]")
++        logger.info("BarkNotifier: Emitting Mobile Broadcast [%s]", title)
+         try:
+             safe_title = quote(title, safe='')
+             safe_msg = quote(message, safe='')
+@@ -54,10 +55,37 @@ class BarkNotifier:
+             # 15 second timeout to prevent blocking thread execution
+             resp = requests.get(dispatch_url, timeout=15.0)
+             if resp.status_code == 200:
+-                logger.debug(f"BarkNotifier: Push delivered successfully.")
++                logger.debug("BarkNotifier: Push delivered successfully.")
+             else:
+-                logger.warning(f"BarkNotifier: Server returned status {resp.status_code}")
++                logger.warning("BarkNotifier: Server returned status %s", resp.status_code)
+             
+         except Exception as e:
+-            logger.warning(f"BarkNotifier: Failed bridging notification payload remotely -> {e}")
++            logger.warning("BarkNotifier: Failed bridging notification payload remotely -> %s", e)
+ 
++    def _check_and_reset_daily_counter(self) -> None:
++        """Resets the daily upload counter if the calendar date has changed."""
++        today = datetime.date.today().isoformat()
++        if today != self._summary_date:
++            self._daily_upload_count = 0
++            self._summary_date = today
++
++    def record_upload_success(self) -> None:
++        """Increments the in-memory daily upload counter. Call once per successful upload."""
++        self._check_and_reset_daily_counter()
++        self._daily_upload_count += 1
++
++    def push_daily_summary(self) -> None:
++        """
++        Sends a passive daily summary push with the current accumulated upload count.
++        Uses level='passive' (silent delivery) to avoid notification fatigue.
++        No-op if counter is zero.
++        """
++        self._check_and_reset_daily_counter()
++        count = self._daily_upload_count
++        if count == 0:
++            return
++        self.push(
++            "DouyinSync Daily Summary",
++            "%s video(s) uploaded today" % count,
++            level="passive"
++        )
+diff --git a/modules/scheduler.py b/modules/scheduler.py
+index 7168e9a..d8d436f 100644
+--- a/modules/scheduler.py
++++ b/modules/scheduler.py
+@@ -1,24 +1,26 @@
+ import time
+ import threading
+ import requests
++import asyncio
+ from apscheduler.schedulers.background import BackgroundScheduler
+ from apscheduler.triggers.interval import IntervalTrigger
++from apscheduler.triggers.cron import CronTrigger
+ 
+ from modules.logger import logger
+ from modules.config_manager import config
+ from modules.database import VideoDAO
+ from modules.douyin_fetcher import DouyinFetcher
+ from modules.downloader import Downloader
+-from modules.youtube_uploader import YouTubeUploader
++from modules.youtube_uploader import YoutubeUploader
+ from modules.sweeper import DiskSweeper
+ from modules.notifier import BarkNotifier
++from utils.models import VideoRecord, ProxyConfig
+ 
+ class PipelineCoordinator:
+     def __init__(self):
+         self.scheduler = BackgroundScheduler()
+         self.fetcher = DouyinFetcher()
+         self.downloader = Downloader()
+-        self.uploader = YouTubeUploader()
+         self.sweeper = DiskSweeper()
+         self.notifier = BarkNotifier()
+         
+@@ -35,7 +37,7 @@ class PipelineCoordinator:
+             requests.get("https://www.baidu.com", timeout=5)
+             return True
+         except Exception as e:
+-            logger.warning(f"PipelineCoordinator: Pre-flight network probe isolated environment -> {e}")
++            logger.warning("PipelineCoordinator: Pre-flight network probe isolated environment -> %s", e)
+             return False
+ 
+     def recover_zombies(self):
+@@ -43,7 +45,7 @@ class PipelineCoordinator:
+         logger.info("PipelineCoordinator: Executing Self-Healing Zombie Reverter sequence...")
+         reverted = VideoDAO.revert_zombies()
+         if reverted > 0:
+-            logger.warning(f"PipelineCoordinator: Successfully rescued {reverted} stranded zombie tasks from previous unexpected halt.")
++            logger.warning("PipelineCoordinator: Successfully rescued %s stranded zombie tasks from previous unexpected halt.", reverted)
+ 
+     def primary_sync_job(self):
+         """The master scheduled task bridging and governing all Epics."""
+@@ -52,15 +54,15 @@ class PipelineCoordinator:
+             return
+         
+         try:
+-            self._run_sync_cycle()
++            asyncio.run(self._run_async_cycle())
+         finally:
+             self._pipeline_lock.release()
+ 
+-    def _run_sync_cycle(self):
+-        """Internal sync cycle, always called under lock."""
++    async def _run_async_cycle(self):
++        """Internal sync cycle, executed asynchronously."""
+         logger.info("PipelineCoordinator: === Initiating Scheduled Primary Sync Cycle ===")
+         
+-        # Hot-reload configurations at the start of every cycle so dashboard limits reflect immediately
++        # Hot-reload configurations
+         config.reload()
+ 
+         if not self.check_network():
+@@ -73,15 +75,22 @@ class PipelineCoordinator:
+ 
+         is_youtube_blocked = time.time() < self.youtube_quota_exceeded_until
+         if is_youtube_blocked:
+-             logger.warning("PipelineCoordinator: CIRCUIT BREAKER ACTIVE. YouTube APIs are suspended until the next 24h cycle resets. (Douyin scraping will continue mapping natively.)")
++             logger.warning("PipelineCoordinator: CIRCUIT BREAKER ACTIVE. YouTube APIs are suspended until the next 24h cycle resets.")
++
++        # Story 1.5 - Setup YouTube parameters and proxy securely
++        yt_token = str(config.get("youtube_api_token", ""))
++        yt_proxy = str(config.get("youtube_proxy", ""))
++        proxy_config = ProxyConfig(http=yt_proxy, https=yt_proxy) if yt_proxy else None
++        
++        # Isolated network client
++        uploader = YoutubeUploader(token=yt_token, proxy_config=proxy_config)
+ 
+         try:
+-            # Phase 1. Fetcher Subroutine - with pagination support
++            # Phase 1. Fetcher Subroutine
+             douyin_accounts = config.get("douyin_accounts", [])
+             for account in douyin_accounts:
+                 if isinstance(account, dict):
+                     if not account.get("enable", True):
+-                        logger.debug(f"PipelineCoordinator: Skipping disabled account [{account.get('mark', '?')}]")
+                         continue
+                     account_url = account.get("url", "")
+                     account_mark = account.get("mark", "")
+@@ -92,198 +101,162 @@ class PipelineCoordinator:
+                 if not account_url:
+                     continue
+                 
+-                # Pagination loop: keep fetching until we find at least 1 new pending video
+                 max_cursor = 0
+                 max_pages = config.get("max_scroll_pages", 5)
+-                found_new = False
+                 
+                 for page in range(max_pages):
+-                    posts, next_cursor, has_more = self.fetcher.fetch_user_posts(account_url, max_cursor=max_cursor)
++                    try:
++                        posts, next_cursor, has_more = await self.fetcher.fetch_user_posts(account_url, max_cursor)
++                    except Exception as e:
++                        logger.error("PipelineCoordinator: Fetcher failed for account [%s]: %s", account_url, e)
++                        break
+                     
+                     # Phase 2. Database Deduplication Filter
+                     for post in posts:
+-                        post['account_mark'] = account_mark
++                        # Augment the already-typed VideoRecord with account context
++                        post.account_mark = account_mark
++                        
+                         is_new = VideoDAO.insert_video_if_unique(post)
+                         if is_new:
+-                            logger.info(f"PipelineCoordinator: Tracked new video discovery mapping [{post['douyin_id']}]")
+-                            found_new = True
++                            logger.info("PipelineCoordinator: Tracked new video discovery mapping [%s]", post.douyin_id)
+                     
+-                    # Check if we now have pending videos
+                     pending_check = VideoDAO.get_pending_videos(limit=1)
+                     if pending_check:
+-                        logger.info(f"PipelineCoordinator: Found pending videos after page {page + 1}. Stopping pagination.")
+                         break
+                     
+-                    # If no more pages available, stop
+                     if not has_more or next_cursor == 0:
+-                        logger.info(f"PipelineCoordinator: Reached end of video list for account [{account_mark}] after {page + 1} pages.")
+                         break
+                     
+                     max_cursor = next_cursor
+-                    logger.info(f"PipelineCoordinator: All videos on page {page + 1} already processed. Scrolling to next page (cursor={max_cursor})...")
+ 
+-            # Phase 3. Downloader & Uploader Sync — STRICT: only 1 video per cycle
++            # Phase 3. Downloader & Uploader Sync
+             daily_limit = config.get("daily_upload_limit", 1)
+             uploaded_today = VideoDAO.get_uploaded_today_count()
+             
+             if uploaded_today >= daily_limit:
+-                logger.info(f"PipelineCoordinator: Daily upload limit reached ({uploaded_today}/{daily_limit}). Upload paused until tomorrow.")
++                logger.info("PipelineCoordinator: Daily upload limit reached.")
+             else:
+                 max_per_cycle = config.get("max_videos_per_run", 1)
+-                # slots_left = how many videos we can still upload this cycle
+-                # capped by both the daily quota remainder and the per-run limit
+                 slots_left = min(daily_limit - uploaded_today, max_per_cycle)
+-                logger.info(f"PipelineCoordinator: Upload budget this cycle: {slots_left} slot(s) (daily_limit={daily_limit}, uploaded_today={uploaded_today}, max_per_run={max_per_cycle}).")
+                 
+-                # Phase 3-Pre: Re-upload videos that were downloaded but failed to upload
++                # Phase 3-Pre: Re-upload videos
+                 if not is_youtube_blocked:
+                     uploadable = VideoDAO.get_uploadable_videos(limit=slots_left)
+                     for video in uploadable:
+-                        if slots_left <= 0:
+-                            break
+-                        dy_id = video['douyin_id']
+-                        title_short = (video['title'] or dy_id)[:50]
+-                        local_video = video.get('local_video_path', '')
+-                        local_cover = video.get('local_cover_path', '')
++                        if slots_left <= 0: break
++                        dy_id = video.douyin_id
++                        local_video = video.local_video_path
+                         
+-                        # Verify local files still exist
+                         from pathlib import Path
+                         if not local_video or not Path(local_video).exists():
+-                            logger.warning(f"PipelineCoordinator: Local video missing for [{dy_id}], skipping re-upload. Resetting to pending.")
++                            logger.warning("PipelineCoordinator: Local video missing for [%s], skipping re-upload.", dy_id)
+                             VideoDAO.update_status(dy_id, 'pending')
+                             continue
+                         
+-                        logger.info(f"PipelineCoordinator: Re-uploading previously downloaded video [{dy_id}]")
++                        logger.info("PipelineCoordinator: Re-uploading previously downloaded video [%s]", dy_id)
+                         VideoDAO.update_status(dy_id, 'uploading')
+                         
+-                        base_title = video['title'] or dy_id
+-                        # Try to extract OCR text from cover filename pattern
+-                        ocr_text = ""
+-                        if local_cover and Path(local_cover).exists():
+-                            try:
+-                                from modules.win_ocr import get_text_from_image
+-                                # Re-read OCR from the original jpg (not the _yt version)
+-                                orig_jpg = Path(local_cover).parent / f"{dy_id}.jpg"
+-                                if orig_jpg.exists():
+-                                    extracted = get_text_from_image(str(orig_jpg))
+-                                    if extracted:
+-                                        ocr_text = " ".join(extracted.split())
+-                            except Exception:
+-                                pass
+-                        
+-                        if ocr_text:
+-                            enhanced_title = f"{ocr_text} | {base_title}"[:90]
+-                            enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+-                        else:
+-                            enhanced_title = base_title[:90]
+-                            enhanced_desc = video['description']
+-                        
+-                        yt_id = self.uploader.upload_video_sequence(
+-                            dy_id, local_video, local_cover, enhanced_title, enhanced_desc
+-                        )
+-                        
+-                        if yt_id == "QUOTA_EXCEEDED":
+-                            logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+-                            self.notifier.push("Quota Exceeded", "YouTube API limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+-                            self.youtube_quota_exceeded_until = time.time() + 86400
+-                            VideoDAO.update_status(dy_id, 'downloaded')
+-                            break
+-                        
+-                        if yt_id:
+-                            VideoDAO.update_status(dy_id, 'uploaded')
+-                            self.notifier.push("重传成功", f"视频 [{title_short}] 重新上传YouTube成功!", "active")
+-                            slots_left -= 1
+-
+-                        else:
+-                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.get('retry_count', 0) + 1})
+-                            self.notifier.push("重传失败", f"视频 [{title_short}] 重新上传YouTube失败", "timeSensitive")
++                        try:
++                            # Non-blocking async upload
++                            yt_id = await uploader.upload(video)
++                            if yt_id:
++                                VideoDAO.update_status(dy_id, 'uploaded')
++                                self.notifier.record_upload_success()  # AC2: daily counter
++                                slots_left -= 1
++                            else:
++                                retry = video.retry_count + 1
++                                new_status = 'give_up' if retry >= 3 else 'failed'
++                                VideoDAO.update_status(dy_id, new_status, {'retry_count': retry})
++                                if new_status == 'give_up':
++                                    self.notifier.push(  # AC3: immediate critical alert
++                                        "DouyinSync: Upload Give Up",
++                                        "Video [%s] failed 3 times and was abandoned" % dy_id,
++                                        level="timeSensitive"
++                                    )
++                        except Exception as e:
++                            logger.error("Youtube upload error for [%s]: %s", dy_id, e)
++                            if type(e).__name__ in ["YoutubeQuotaError", "QuotaExceededError"]:
++                                logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota!")
++                                self.youtube_quota_exceeded_until = time.time() + 86400
++                                VideoDAO.update_status(dy_id, 'downloaded')
++                                self.notifier.push(  # AC3: quota exhaustion alert
++                                    "DouyinSync: YouTube Quota Exhausted",
++                                    "API quota exceeded for account [%s]. Suspended 24h." % video.account_mark,
++                                    level="timeSensitive"
++                                )
++                                break
++                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.retry_count + 1})
+                 
+-                # Phase 3-Main: Download + Upload new pending videos (if slots remain) 
++                # Phase 3-Main: Download + Upload new
+                 if slots_left > 0:
+                     pending_videos = VideoDAO.get_pending_videos(limit=slots_left)
+                 else:
+                     pending_videos = []
+-                    
+-                if pending_videos:
+-                    logger.info(f"PipelineCoordinator: Processing {len(pending_videos)} new video(s) this cycle (max_per_run={max_per_cycle}).")
+                 
+                 for video in pending_videos:
+-                    dy_id = video['douyin_id']
+-                    title_short = (video['title'] or dy_id)[:50]
++                    dy_id = video.douyin_id
+                     VideoDAO.update_status(dy_id, 'processing')
+                     
+-                    # Phase 3A-Pre: Re-fetch fresh CDN URLs (Douyin CDN tokens expire quickly)
+-                    video_url = video['video_url']
+-                    cover_url = video['cover_url']
++                    video_url = video.video_url
++                    cover_url = video.cover_url
+                     try:
+-                        fresh = self.fetcher.refresh_video_url(dy_id, douyin_accounts)
++                        fresh = await self.fetcher.refresh_video_url(dy_id, douyin_accounts)
+                         if fresh:
+                             video_url = fresh.get('video_url', video_url)
+                             cover_url = fresh.get('cover_url', cover_url)
+                             VideoDAO.update_fresh_urls(dy_id, video_url, cover_url)
+-                            logger.info(f"PipelineCoordinator: Refreshed CDN URLs for [{dy_id}]")
+-                        else:
+-                            logger.warning(f"PipelineCoordinator: Could not refresh URLs for [{dy_id}], using cached URLs.")
+                     except Exception as e:
+-                        logger.warning(f"PipelineCoordinator: URL refresh failed for [{dy_id}]: {e}. Using cached URLs.")
++                        logger.warning("PipelineCoordinator: URL refresh failed for [%s]: %s", dy_id, e)
+                     
+-                    # Phase 3A: Download
+-                    paths = self.downloader.download_media(dy_id, video_url, cover_url)
+-                    if not paths:
++                    try:
++                        paths = await self.downloader.download_media(dy_id, video_url, cover_url)
++                        if not paths:
++                            VideoDAO.update_status(dy_id, 'failed')
++                            continue
++                    except Exception as e:
++                        logger.error("PipelineCoordinator: Downloader Exception for [%s]: %s", dy_id, e)
+                         VideoDAO.update_status(dy_id, 'failed')
+-                        self.notifier.push("下载失败", f"视频 [{title_short}] 下载失败", "timeSensitive")
+                         continue
+                     
+-                    self.notifier.push("下载完成", f"视频 [{title_short}] 已保存到本地", "active")
+-                        
+-                    # Phase 3A-Post: Store local mapping paths and lock downloaded
++                    video.local_video_path = paths['local_video_path']
++                    video.local_cover_path = paths['local_cover_path']
++                    
+                     VideoDAO.update_status(dy_id, 'downloaded', {
+-                        'local_video_path': paths['local_video_path'],
+-                        'local_cover_path': paths['local_cover_path']
++                        'local_video_path': video.local_video_path,
++                        'local_cover_path': video.local_cover_path
+                     })
+ 
+-                    # Epic 4.3 Check Quota circuit
+                     if is_youtube_blocked:
+                          continue
+                          
+-                    # Phase 3B: Upload
+                     VideoDAO.update_status(dy_id, 'uploading')
+                     
+-                    ocr_text = paths.get('ocr_text', '')
+-                    base_title = video['title'] or dy_id
+-                    
+-                    if ocr_text:
+-                        enhanced_title = f"{ocr_text} | {base_title}"[:90]
+-                        enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+-                    else:
+-                        enhanced_title = base_title[:90]
+-                        enhanced_desc = video['description']
+-                        
+-                    yt_id = self.uploader.upload_video_sequence(
+-                        dy_id, paths['local_video_path'], paths['local_cover_path'], enhanced_title, enhanced_desc
+-                    )
+-                    
+-                    if yt_id == "QUOTA_EXCEEDED":
+-                        logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+-                        self.notifier.push("Quota Exceeded", "YouTube API daily limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+-                        self.youtube_quota_exceeded_until = time.time() + 86400
+-                        VideoDAO.update_status(dy_id, 'downloaded')
+-                        break  # Stop processing remaining pending videos
+-                    
+-                    if yt_id:
+-                        VideoDAO.update_status(dy_id, 'uploaded')
+-                        self.notifier.push("上传成功", f"视频 [{title_short}] 已成功上传YouTube!", "active")
+-                        slots_left -= 1  # R1: decrement to prevent daily limit overrun
+-                        if slots_left <= 0:
+-                            logger.info("PipelineCoordinator: All upload slots consumed. Ending cycle.")
++                    try:
++                        # Async network upload natively via httpx
++                        yt_id = await uploader.upload(video)
++                        if yt_id:
++                            VideoDAO.update_status(dy_id, 'uploaded')
++                            self.notifier.record_upload_success()  # AC2: daily counter
++                            slots_left -= 1
++                            if slots_left <= 0: break
++                        else:
++                            VideoDAO.update_status(dy_id, 'failed')
++                    except Exception as e:
++                        logger.error("Youtube upload exception: %s", e)
++                        if type(e).__name__ == "YoutubeQuotaError":
++                            logger.critical("Circuit Breaker Quota engaged!")
++                            self.youtube_quota_exceeded_until = time.time() + 86400
++                            VideoDAO.update_status(dy_id, 'downloaded')
++                            self.notifier.push(  # AC3: quota critical alert
++                                "DouyinSync: YouTube Quota Exhausted",
++                                "API quota limit hit. Pipeline suspended 24h.",
++                                level="timeSensitive"
++                            )
+                             break
+-                    else:
+                         VideoDAO.update_status(dy_id, 'failed')
+-                        self.notifier.push("上传失败", f"视频 [{title_short}] 上传YouTube失败", "timeSensitive")
+ 
+         except Exception as e:
+-            logger.error(f"PipelineCoordinator: Unhandled Exception in main sync loop engine: {e}. Auto-Recovering for next cycle.")
+-            self.notifier.push("系统异常", f"Pipeline 异常: {str(e)[:100]}", "timeSensitive")
++            logger.error("PipelineCoordinator: Unhandled Exception in main sync loop engine: %s", e)
+ 
+         logger.info("PipelineCoordinator: === Pipeline Cycle Terminated ===")
+ 
+@@ -295,25 +268,25 @@ class PipelineCoordinator:
+         """Mounts background logical dependencies cleanly."""
+         self.recover_zombies()
+         
+-        # Dynamic config interval loading
+         interval = config.get("sync_interval_minutes", 60)
+         self.scheduler.add_job(
+             self.primary_sync_job, 
+             IntervalTrigger(minutes=interval), 
+             id='primary_sync',
+-            max_instances=1 # Prevents overlapping parallel jobs if one block processes videos too long
++            max_instances=1
+         )
+         
+-        # Fire Janitor logic sweeping orphaned mp4s daily independently
+         self.scheduler.add_job(self.janitor_job, IntervalTrigger(hours=24), id='janitor_sync')
+         
++        # Epic 3.2: Daily passive Bark summary (sent at 23:50)
++        self.scheduler.add_job(self.notifier.push_daily_summary, CronTrigger(hour=23, minute=50), id='daily_summary_push')
++        
+         self.scheduler.start()
+         
+-        # Fire once immediately for immediate bootstrapping feedback
+         import datetime
+         self.scheduler.add_job(self.primary_sync_job, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=5))
+-        logger.info(f"PipelineCoordinator: Background APScheduler engaged natively. Rhythm: {interval} minutes.")
++        logger.info("PipelineCoordinator: Background APScheduler engaged natively. Rhythm: %s minutes.", interval)
+ 
+     def shutdown(self):
+         logger.info("PipelineCoordinator: Received shutdown broadcast. Emptying queues gracefully...")
+-        self.scheduler.shutdown(wait=False)
++        self.scheduler.shutdown(wait=True)
+diff --git a/modules/sweeper.py b/modules/sweeper.py
+index f448a1b..99a6662 100644
+--- a/modules/sweeper.py
++++ b/modules/sweeper.py
+@@ -22,16 +22,16 @@ class DiskSweeper:
+             total, used, free = shutil.disk_usage(DOWNLOAD_DIR.anchor)
+             free_gb = free / (1024**3)
+             if free_gb < 2.0:
+-                logger.critical(f"DiskSweeper: CRITICAL - Hard drive partition has only {free_gb:.2f}GB remaining! Danger zone.")
++                logger.critical("DiskSweeper: CRITICAL - Hard drive partition has only %.2fGB remaining! Danger zone.", free_gb)
+                 return False
+             return True
+         except Exception as e:
+-            logger.warning(f"DiskSweeper: Failed to execute IO disk verification -> {e}")
++            logger.warning("DiskSweeper: Failed to execute IO disk verification -> %s", e)
+             return True # Fallback
+ 
+     def purge_stale_media(self, max_age_days: int = 7):
+         """Recursively evicts any files aged past the boundary protecting the SSD infrastructure."""
+-        logger.info(f"DiskSweeper: Conducting sweep for media older than {max_age_days} days...")
++        logger.info("DiskSweeper: Conducting sweep for media older than %s days...", max_age_days)
+         
+         cutoff_epoch = time.time() - (max_age_days * 86400)
+         reclaimed_bytes = 0
+@@ -49,9 +49,9 @@ class DiskSweeper:
+                             reclaimed_bytes += size
+                             
+             if reclaimed_bytes > 0:
+-                logger.info(f"DiskSweeper: Janitor operation complete. Reprieved {reclaimed_bytes / (1024**2):.2f} MB of SSD sector space.")
++                logger.info("DiskSweeper: Janitor operation complete. Reprieved %.2f MB of SSD sector space.", reclaimed_bytes / (1024**2))
+             else:
+                 logger.debug("DiskSweeper: Floors are pristine. No garbage accumulation detected.")
+                 
+         except Exception as e:
+-            logger.error(f"DiskSweeper: Unexpected recursive fault during janitor sequence: {e}")
++            logger.error("DiskSweeper: Unexpected recursive fault during janitor sequence: %s", e)
+diff --git a/modules/tray_app.py b/modules/tray_app.py
+index ad5ebad..1090e18 100644
+--- a/modules/tray_app.py
++++ b/modules/tray_app.py
+@@ -102,7 +102,7 @@ class TrayController:
+                 cmd = [sys.executable, path, "settings"]
+                 subprocess.Popen(cmd)
+         except Exception as e:
+-            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
++            logger.error("Tray Menu UI: Process Fork Failed -> %s", e)
+ 
+     def action_manual_run(self, icon, item):
+         logger.info("Tray Menu UI: Manually running pipeline (in-process)")
+@@ -143,7 +143,7 @@ class TrayController:
+                 cmd = [sys.executable, path, "stats"]
+                 subprocess.Popen(cmd)
+         except Exception as e:
+-            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
++            logger.error("Tray Menu UI: Process Fork Failed -> %s", e)
+ 
+     def action_dashboard(self, icon, item):
+         logger.info("Tray Menu UI: Constructing detached Python Process for Tkinter Dashboard...")
+@@ -158,7 +158,7 @@ class TrayController:
+                 cmd = [sys.executable, path, "dashboard"]
+                 subprocess.Popen(cmd)
+         except Exception as e:
+-            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
++            logger.error("Tray Menu UI: Process Fork Failed -> %s", e)
+ 
+     def action_reload_config(self, icon, item):
+         """Dispatches a request to cleanly fetch from config.json again."""
+diff --git a/modules/win_ocr.py b/modules/win_ocr.py
+index 1f19f68..bdf484e 100644
+--- a/modules/win_ocr.py
++++ b/modules/win_ocr.py
+@@ -24,7 +24,7 @@ async def _recognize_text_async(image_path: str) -> str:
+         result = await engine.recognize_async(software_bitmap)
+         return result.text
+     except Exception as e:
+-        logger.warning(f"OCR async recognition error: {e}")
++        logger.warning("OCR async recognition error: %s", e)
+         return ""
+ 
+ def get_text_from_image(image_path: str) -> str:
+@@ -62,5 +62,5 @@ def get_text_from_image(image_path: str) -> str:
+             # Main thread fast path
+             return asyncio.run(_recognize_text_async(image_path))
+     except Exception as e:
+-        logger.warning(f"Failed to run Windows Native OCR: {e}")
++        logger.warning("Failed to run Windows Native OCR: %s", e)
+         return ""
+diff --git a/modules/youtube_uploader.py b/modules/youtube_uploader.py
+index 43d2d33..f4b9be0 100644
+--- a/modules/youtube_uploader.py
++++ b/modules/youtube_uploader.py
+@@ -1,274 +1,139 @@
+ import os
+-import httplib2
++import httpx
++import logging
++import json
++import aiofiles
+ from pathlib import Path
+-from urllib.parse import urlparse
++from typing import Optional
+ 
+-# Google API Client tools
+ from google_auth_oauthlib.flow import InstalledAppFlow
+-from google.auth.transport.requests import Request
++from google.auth.transport.requests import Request as GoogleRequest
+ from google.oauth2.credentials import Credentials
+-from googleapiclient.discovery import build
+-from googleapiclient.http import MediaFileUpload
+ 
+-import sys
++from utils.models import VideoRecord, ProxyConfig, YoutubeQuotaError, YoutubeUploadError, YoutubeNetworkError
+ from modules.logger import logger
+-from modules.config_manager import config
+ 
+-if getattr(sys, 'frozen', False):
+-    PROJECT_ROOT = Path(sys.executable).parent
+-else:
+-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+-
+-class YouTubeUploader:
+-    # Essential scopes for full YouTube Data API v3 upload ability
++class YoutubeUploader:
+     SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+-    
+-    def __init__(self):
+-        self.api_service_name = "youtube"
+-        self.api_version = "v3"
+-        self.client_secrets_file = PROJECT_ROOT / config.get("youtube_client_secret_file", "client_secret.json")
+-        self.token_file = PROJECT_ROOT / "youtube_token.json"
+-        
+-        self.category_id = config.get("youtube_category_id", "22")
+-        self.privacy_status = config.get("youtube_privacy_status", "public")
+-        self.youtube_client = None
+ 
+-    def _build_proxy_http(self):
+-        """Constructs a raw httplib2 instance mapped securely through the split-tunnel proxy config."""
+-        proxies = config.get_proxies()
+-        
+-        # If proxy is explicitly configured (e.g. "http://127.0.0.1:7890"), we bridge the python-socket
+-        if proxies and "http" in proxies:
+-            proxy_url = proxies["http"]
+-            parsed = urlparse(proxy_url)
+-            
+-            host = parsed.hostname
+-            port = parsed.port
+-            
+-            if host and port:
+-                logger.info(f"YouTubeUploader: Routing traffic via Proxy -> {host}:{port}")
+-                proxy_info = httplib2.ProxyInfo(
+-                    proxy_type=httplib2.socks.PROXY_TYPE_HTTP_NO_TUNNEL if proxy_url.startswith("http") else httplib2.socks.PROXY_TYPE_SOCKS5,
+-                    proxy_host=host,
+-                    proxy_port=port
+-                )
+-                return httplib2.Http(proxy_info=proxy_info, timeout=60)
+-        
+-        # Direct connection fallback bypassing OS defaults
+-        logger.debug("YouTubeUploader: Routing traffic via DIRECT connection.")
+-        return httplib2.Http(timeout=60)
++    def __init__(self, client_secrets_file: str = "client_secret.json", token_file: str = "youtube_token.json", proxy_config: Optional[ProxyConfig] = None, token: Optional[str] = None):
++        self.client_secrets_file = Path(client_secrets_file)
++        self.token_file = Path(token_file)
++        self.proxy_config = proxy_config
++        self.token = token
+ 
+     def authenticate(self) -> bool:
+         """Boots the OAuth 2.0 flow securely or retrieves via cached refresh tokens."""
+         creds = None
+         
+-        logger.info(f"YouTubeUploader: Token file path: {self.token_file}")
+-        logger.info(f"YouTubeUploader: Client secrets path: {self.client_secrets_file}")
+-        
+         if self.token_file.exists():
+             try:
+                 creds = Credentials.from_authorized_user_file(str(self.token_file), self.SCOPES)
+-                logger.info("YouTubeUploader: Loaded cached token successfully.")
+             except Exception as e:
+-                logger.warning(f"YouTubeUploader: Failed to parse cached token. Rebooting auth cycle: {e}")
++                logger.warning("Failed to parse cached token: %s", e)
+                 
+-        # If no valid credentials, run the auth flow locally
+         if not creds or not creds.valid:
+             try:
+                 if creds and creds.expired and creds.refresh_token:
+-                    logger.info("YouTubeUploader: Token expired, requesting refresh from Google...")
+-                    try:
+-                        # Use proxy-aware session for token refresh
+-                        import google.auth.transport.requests
+-                        import requests as req_lib
+-                        
+-                        session = req_lib.Session()
+-                        proxies = config.get_proxies()
+-                        if proxies:
+-                            session.proxies.update(proxies)
+-                            logger.info(f"YouTubeUploader: Using proxy for token refresh: {proxies.get('http', 'none')}")
+-                        
+-                        creds.refresh(google.auth.transport.requests.Request(session=session))
+-                        logger.info("YouTubeUploader: Token refreshed successfully.")
+-                    except Exception as refresh_err:
+-                        logger.warning(f"YouTubeUploader: Refresh failed: {refresh_err}. Forcing re-auth.")
+-                        creds = None
+-                
+-                if not creds:
++                    logger.info("Token expired, requesting refresh...")
++                    creds.refresh(GoogleRequest())
++                else:
+                     if not self.client_secrets_file.exists():
+-                        logger.error(f"YouTubeUploader: FATAL! Missing {self.client_secrets_file}.")
++                        logger.error("Missing %s.", self.client_secrets_file)
+                         return False
+                     
+-                    logger.info("YouTubeUploader: Starting browser OAuth flow. Please complete login in browser.")
+                     flow = InstalledAppFlow.from_client_secrets_file(
+                         str(self.client_secrets_file), self.SCOPES
+                     )
+                     creds = flow.run_local_server(port=0, open_browser=True)
+-                    logger.info("YouTubeUploader: Browser auth completed successfully.")
+                     
+-                # Ensure parent directory exists before writing token
+                 self.token_file.parent.mkdir(parents=True, exist_ok=True)
+                 with open(self.token_file, 'w') as token_cache:
+                     token_cache.write(creds.to_json())
+-                logger.info(f"YouTubeUploader: Token cached to {self.token_file}")
+             except Exception as e:
+-                logger.error(f"YouTubeUploader: Authentication failure: {e}")
+-                import traceback
+-                logger.error(f"YouTubeUploader: Traceback: {traceback.format_exc()}")
++                logger.error("Authentication failure: %s", e)
+                 return False
+                 
+-        try:
+-            # Use google-auth native transport (requests-based) instead of httplib2
+-            # httplib2 has a known bug: "Redirected but the response is missing a Location: header"
+-            # during YouTube resumable uploads. credentials= param uses requests which works correctly.
+-            self.youtube_client = build(
+-                self.api_service_name, 
+-                self.api_version, 
+-                credentials=creds, 
+-                cache_discovery=False
+-            )
+-            logger.info("YouTubeUploader: API service built successfully (google-auth native).")
+-            return True
+-        except Exception as e:
+-            logger.error(f"YouTubeUploader: Failed to build API service: {e}")
+-            import traceback
+-            logger.error(f"YouTubeUploader: Traceback: {traceback.format_exc()}")
+-            return False
+-
+-    def _sanitize_metadata(self, text: str, limit: int) -> str:
+-        """Safely truncates text boundaries to strict YouTube constraints, appending ellipsis gracefully."""
+-        if not text:
+-            return ""
+-        if len(text) > limit:
+-            return text[:limit - 3] + "..."
+-        return text
+-
+-    def upload_video_sequence(self, douyin_id: str, video_path: str, cover_path: str, title: str, desc: str) -> str:
+-        """
+-        Master operation: Stream chunk MP4, inserts Metadata, then overrides tracking Custom Thumbnail.
+-        Returns the published YouTube Video ID gracefully, or False if aborted.
+-        """
+-        if not self.youtube_client:
+-            if not self.authenticate():
+-                return False
++        self.token = creds.token
++        return True
+ 
+-        if not os.path.exists(video_path):
+-            logger.error(f"YouTubeUploader: Core Video payload missing locally at {video_path}")
+-            return False
+-
+-        logger.info(f"YouTubeUploader: Initiating Chunked Sequence API Upload for [{douyin_id}]")
+-
+-        safe_title = self._sanitize_metadata(title, 100)
+-        safe_desc = self._sanitize_metadata(desc, 5000)
+-
+-        body = {
+-            'snippet': {
+-                'title': safe_title,
+-                'description': safe_desc,
+-                'categoryId': self.category_id
+-            },
+-            'status': {
+-                'privacyStatus': self.privacy_status,
+-                'selfDeclaredMadeForKids': False
+-            }
++    async def upload(self, video: VideoRecord) -> str:
++        if not os.path.exists(video.local_video_path):
++            raise FileNotFoundError(f"Video file not found: {video.local_video_path}")
++            
++        proxies = {}
++        if self.proxy_config:
++            if self.proxy_config.http:
++                proxies["http://"] = self.proxy_config.http
++            if self.proxy_config.https:
++                proxies["https://"] = self.proxy_config.https
++
++        headers = {
++            "Authorization": f"Bearer {self.token}",
++            "X-Upload-Content-Type": "video/mp4",
++            "X-Upload-Content-Length": str(os.path.getsize(video.local_video_path))
+         }
+ 
+-        try:
+-            # Resumable Chunk Controller (2MB slices ensures no memory stack blows out per NFR2)
+-            media = MediaFileUpload(
+-                video_path,
+-                chunksize=1024*1024*2, 
+-                resumable=True
+-            )
+-
+-            request = self.youtube_client.videos().insert(
+-                part=",".join(body.keys()),
+-                body=body,
+-                media_body=media
+-            )
+-            
+-            # Blocking byte transfer wrapper loop
+-            response = None
+-            import time
+-            last_log_time = time.time()
+-            retry_count = 0
+-            max_chunk_retries = 10
+-            
+-            while response is None:
+-                try:
+-                    # num_retries=3 handles basic HTTP 5xx codes internally
+-                    status, response = request.next_chunk(num_retries=3)
+-                    if status:
+-                        percent = int(status.progress() * 100)
+-                        if time.time() - last_log_time >= 5.0 or percent == 100:
+-                            logger.info(f"YouTubeUploader: Uploading stream payload... {percent}% done")
+-                            last_log_time = time.time()
+-                    # Reset generic retry count upon successful progress
+-                    retry_count = 0
+-                except Exception as e:
+-                    # Catch all network-level drops (SSL EOF, connection reset, read timeout)
+-                    # F8: Use precise quota detection - check for HttpError with 403 + quotaExceeded reason
+-                    is_quota_error = False
+-                    try:
+-                        from googleapiclient.errors import HttpError
+-                        if isinstance(e, HttpError) and e.resp.status == 403:
+-                            error_details = str(e.content).lower()
+-                            if 'quotaexceeded' in error_details or 'usagelimits' in error_details:
+-                                is_quota_error = True
+-                    except ImportError:
+-                        pass
+-                    
+-                    if is_quota_error or 'quotaexceeded' in str(e).lower():
+-                        raise  # Let the outer except handle the hard circuit breaker
+-                    
+-                    retry_count += 1
+-                    logger.warning(f"YouTubeUploader: Chunk upload interrupted ({retry_count}/{max_chunk_retries}): {e}")
++        async with httpx.AsyncClient(proxies=proxies) as client:
++            try:
++                # 1. Initiate Resumable Upload
++                metadata = {
++                    "snippet": {
++                        "title": video.title,
++                        "description": video.description
++                    },
++                    "status": {
++                        "privacyStatus": "public"
++                    }
++                }
++                
++                resp = await client.post(
++                    "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
++                    json=metadata,
++                    headers=headers
++                )
++                resp.raise_for_status()
++                
++                upload_url = resp.headers.get("Location")
++                if not upload_url:
++                    raise YoutubeUploadError("Resumable upload URL missing")
++                
++                # 2. Upload Video body
++                async def stream_file(filepath):
++                    async with aiofiles.open(filepath, "rb") as f:
++                        while chunk := await f.read(1024 * 1024 * 2):
++                            yield chunk
++                            
++                put_resp = await client.put(upload_url, content=stream_file(video.local_video_path))
++                put_resp.raise_for_status()
++                youtube_id = put_resp.json().get("id")
+                     
+-                    if retry_count > max_chunk_retries:
+-                        logger.error(f"YouTubeUploader: Max chunk retries reached. Aborting upload.")
+-                        raise
++                # 3. Upload thumbnail if exists
++                if video.local_cover_path and os.path.exists(video.local_cover_path):
++                    async with aiofiles.open(video.local_cover_path, "rb") as cf:
++                        cover_content = await cf.read()
++                    thumb_resp = await client.post(
++                        f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={youtube_id}",
++                        headers={"Authorization": f"Bearer {self.token}"},
++                        content=cover_content
++                    )
++                    thumb_resp.raise_for_status()
+                         
+-                    sleep_time = min(60, 2 ** retry_count)
+-                    logger.info(f"YouTubeUploader: Sleeping for {sleep_time}s before resuming chunk upload...")
+-                    time.sleep(sleep_time)
+-                    continue  # F12: explicitly continue the while loop
+-
+-            yt_video_id = response.get('id')
+-            logger.info(f"YouTubeUploader: SUCCESS! Video broadcast complete. https://youtu.be/{yt_video_id}")
+-
+-            # Custom Thumbnail Publisher Trigger overlay (Epic 3.3)
+-            if cover_path and os.path.exists(cover_path):
+-                self._upload_thumbnail(yt_video_id, cover_path)
+-                
+-            return yt_video_id
++                return youtube_id
+ 
+-        except Exception as e:
+-            # Trap Quota Exceeded precisely via googleapiclient HttpError
+-            is_quota = False
+-            try:
+-                from googleapiclient.errors import HttpError
+-                if isinstance(e, HttpError) and e.resp.status == 403:
+-                    error_details = str(e.content).lower()
+-                    if 'quotaexceeded' in error_details or 'usagelimits' in error_details:
+-                        is_quota = True
+-            except ImportError:
+-                pass
+-            
+-            if is_quota or 'quotaexceeded' in str(e).lower():
+-                logger.critical(f"YouTubeUploader: CIRCUIT BREAKER TRIGGERED! API Quota globally exhausted: {e}")
+-                return "QUOTA_EXCEEDED"
+-            logger.error(f"YouTubeUploader: Upload transmission crashed or severely rejected: {e}")
+-            return False
+-
+-    def _upload_thumbnail(self, video_id: str, cover_path: str):
+-        """Attaches the converted JPEG cover precisely onto the freshly minted video node."""
+-        try:
+-            logger.info(f"YouTubeUploader: Commencing Custom Thumbnail API injection for hook [{video_id}]...")
+-            # Explicitly setting mimetype='image/jpeg' bypasses Windows Registry MIME guessing bugs
+-            self.youtube_client.thumbnails().set(
+-                videoId=video_id,
+-                media_body=MediaFileUpload(cover_path, mimetype='image/jpeg')
+-            ).execute()
+-            logger.debug(f"YouTubeUploader: Custom Thumbnail mounted flawlessly.")
+-        except Exception as e:
+-            logger.warning(f"YouTubeUploader: Thumbnail injection severed! Video is online but lacks specified custom mapping. {e}")
++            except httpx.HTTPStatusError as e:
++                # Map Quota errors safely without broad exception handling that swallows our own errors 
++                if e.response.status_code == 403:
++                    try:
++                        err_json = e.response.json()
++                        err_obj = err_json.get("error", {})
++                        errors_list = err_obj.get("errors", [{}])
++                        if errors_list and len(errors_list) > 0:
++                            reason = errors_list[0].get("reason", "")
++                            if reason == "quotaExceeded":
++                                raise YoutubeQuotaError("Quota exceeded")
++                    except ValueError:
++                        pass
++                raise YoutubeUploadError(f"Upload failed: {e}")
++            except httpx.RequestError as e:
++                raise YoutubeNetworkError(f"Network error: {e}")
+diff --git a/requirements.txt b/requirements.txt
+index 88acf68..af93a77 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,4 @@
+-pystray
++pystray[win32]
+ Pillow
+ requests
+ apscheduler
+@@ -6,3 +6,4 @@ google-api-python-client
+ google-auth-oauthlib
+ google-auth-httplib2
+ httplib2
++customtkinter
+diff --git a/tests/test_database.py b/tests/test_database.py
+index 805d351..ee54fc9 100644
+--- a/tests/test_database.py
++++ b/tests/test_database.py
+@@ -83,5 +83,20 @@ class TestDatabase(unittest.TestCase):
+             self.assertEqual(row['local_video_path'], '/fake/path.mp4')
+             self.assertIsInstance(row['updated_at'], int)
+ 
++    def test_get_pipeline_stats(self):
++        test_video1 = VideoRecord(douyin_id="STAT_001", account_mark="A1", status="pending")
++        test_video2 = VideoRecord(douyin_id="STAT_002", account_mark="A2", status="processing")
++        test_video3 = VideoRecord(douyin_id="STAT_003", account_mark="A3", status="uploaded")
++        test_video4 = VideoRecord(douyin_id="STAT_004", account_mark="A4", status="uploaded")
++        VideoDAO.insert_video_if_unique(test_video1)
++        VideoDAO.insert_video_if_unique(test_video2)
++        VideoDAO.insert_video_if_unique(test_video3)
++        VideoDAO.insert_video_if_unique(test_video4)
++
++        stats = VideoDAO.get_pipeline_stats()
++        self.assertEqual(stats.get("pending", 0), 1)
++        self.assertEqual(stats.get("processing", 0), 1)
++        self.assertEqual(stats.get("uploaded", 0), 2)
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tests/test_douyin_fetcher.py b/tests/test_douyin_fetcher.py
+index 59c429c..f6b9e64 100644
+--- a/tests/test_douyin_fetcher.py
++++ b/tests/test_douyin_fetcher.py
+@@ -1,22 +1,23 @@
+ import unittest
+ from modules.douyin_fetcher import DouyinFetcher
++from utils.models import VideoRecord
+ 
+ class TestDouyinFetcher(unittest.TestCase):
+-    def setUp(self):
++    def setUp(self) -> None:
+         self.fetcher = DouyinFetcher()
+         
+-    def test_extract_sec_user_id_success(self):
++    def test_extract_sec_user_id_success(self) -> None:
+         url = "https://www.douyin.com/user/MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7"
+         sec_user_id = self.fetcher._extract_sec_user_id(url)
+         self.assertEqual(sec_user_id, "MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7")
+         
+-    def test_extract_sec_user_id_fail(self):
++    def test_extract_sec_user_id_fail(self) -> None:
+         # A malformed or different URL
+         url = "https://www.douyin.com/notuser/MS4wL"
+         sec_user_id = self.fetcher._extract_sec_user_id(url)
+         self.assertEqual(sec_user_id, "")
+         
+-    def test_parse_video_list_valid_payload(self):
++    def test_parse_video_list_valid_payload(self) -> None:
+         mock_payload = {
+             "aweme_list": [
+                 {
+@@ -43,13 +44,15 @@ class TestDouyinFetcher(unittest.TestCase):
+         # Test 1: Only the video post should be parsed (image post filtered)
+         self.assertEqual(len(results), 1)
+         
+-        # Test 2: Verify fields
++        # Test 2: Result must be a VideoRecord (not a dict)
+         video_rec = results[0]
+-        self.assertEqual(video_rec["douyin_id"], "123456")
+-        self.assertEqual(video_rec["title"], "Test video 1")
++        self.assertIsInstance(video_rec, VideoRecord)
++        self.assertEqual(video_rec.douyin_id, "123456")
++        self.assertEqual(video_rec.title, "Test video 1")
+         # Test 3: The highest bitrate URL should have been selected
+-        self.assertEqual(video_rec["video_url"], "http://vid.high")
+-        self.assertEqual(video_rec["cover_url"], "http://cover.jpg")
++        self.assertEqual(video_rec.video_url, "http://vid.high")
++        self.assertEqual(video_rec.cover_url, "http://cover.jpg")
+ 
+ if __name__ == '__main__':
+     unittest.main()
++
+diff --git a/utils/models.py b/utils/models.py
+index 2bd6c12..cc4de76 100644
+--- a/utils/models.py
++++ b/utils/models.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass, field
+-from typing import List, Optional
++from typing import List, Optional, Any
+ 
+ @dataclass
+ class TargetConfig:
+@@ -30,3 +30,17 @@ class VideoRecord:
+     local_cover_path: Optional[str] = None
+     created_at: Optional[int] = None
+     updated_at: Optional[int] = None
++
++class YoutubeUploadError(Exception):
++    pass
++
++class YoutubeQuotaError(YoutubeUploadError):
++    pass
++
++class YoutubeNetworkError(YoutubeUploadError):
++    pass
++
++@dataclass
++class AppEvent:
++    command: str
++    payload: Optional[Any] = None

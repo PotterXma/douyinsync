@@ -24,7 +24,7 @@ async def _recognize_text_async(image_path: str) -> str:
         result = await engine.recognize_async(software_bitmap)
         return result.text
     except Exception as e:
-        logger.warning(f"OCR async recognition error: {e}")
+        logger.warning("OCR async recognition error: %s", e)
         return ""
 
 def get_text_from_image(image_path: str) -> str:
@@ -62,5 +62,5 @@ def get_text_from_image(image_path: str) -> str:
             # Main thread fast path
             return asyncio.run(_recognize_text_async(image_path))
     except Exception as e:
-        logger.warning(f"Failed to run Windows Native OCR: {e}")
+        logger.warning("Failed to run Windows Native OCR: %s", e)
         return ""

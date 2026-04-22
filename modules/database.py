@@ -238,3 +238,15 @@ class VideoDAO:
         now = int(time.time())
         with db.get_connection() as conn:
             conn.execute(sql, (video_url, cover_url, now, douyin_id))
+
+    @staticmethod
+    def get_pipeline_stats() -> dict[str, int]:
+        """Retrieves aggregated statistics of videos grouped by current status using a safe polling query."""
+        sql = "SELECT status, COUNT(*) as count FROM videos GROUP BY status"
+        stats = {}
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            for row in cursor.execute(sql):
+                stats[row['status']] = row['count']
+        return stats
+

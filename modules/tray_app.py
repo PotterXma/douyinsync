@@ -102,7 +102,7 @@ class TrayController:
                 cmd = [sys.executable, path, "settings"]
                 subprocess.Popen(cmd)
         except Exception as e:
-            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
+            logger.error("Tray Menu UI: Process Fork Failed -> %s", e)
 
     def action_manual_run(self, icon, item):
         logger.info("Tray Menu UI: Manually running pipeline (in-process)")
@@ -143,7 +143,7 @@ class TrayController:
                 cmd = [sys.executable, path, "stats"]
                 subprocess.Popen(cmd)
         except Exception as e:
-            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
+            logger.error("Tray Menu UI: Process Fork Failed -> %s", e)
 
     def action_dashboard(self, icon, item):
         logger.info("Tray Menu UI: Constructing detached Python Process for Tkinter Dashboard...")
@@ -158,7 +158,7 @@ class TrayController:
                 cmd = [sys.executable, path, "dashboard"]
                 subprocess.Popen(cmd)
         except Exception as e:
-            logger.error(f"Tray Menu UI: Process Fork Failed -> {e}")
+            logger.error("Tray Menu UI: Process Fork Failed -> %s", e)
 
     def action_reload_config(self, icon, item):
         """Dispatches a request to cleanly fetch from config.json again."""

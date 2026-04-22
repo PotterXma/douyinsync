@@ -1,22 +1,23 @@
 import unittest
 from modules.douyin_fetcher import DouyinFetcher
+from utils.models import VideoRecord
 
 class TestDouyinFetcher(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.fetcher = DouyinFetcher()
         
-    def test_extract_sec_user_id_success(self):
+    def test_extract_sec_user_id_success(self) -> None:
         url = "https://www.douyin.com/user/MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7"
         sec_user_id = self.fetcher._extract_sec_user_id(url)
         self.assertEqual(sec_user_id, "MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7")
         
-    def test_extract_sec_user_id_fail(self):
+    def test_extract_sec_user_id_fail(self) -> None:
         # A malformed or different URL
         url = "https://www.douyin.com/notuser/MS4wL"
         sec_user_id = self.fetcher._extract_sec_user_id(url)
         self.assertEqual(sec_user_id, "")
         
-    def test_parse_video_list_valid_payload(self):
+    def test_parse_video_list_valid_payload(self) -> None:
         mock_payload = {
             "aweme_list": [
                 {
@@ -43,13 +44,15 @@ class TestDouyinFetcher(unittest.TestCase):
         # Test 1: Only the video post should be parsed (image post filtered)
         self.assertEqual(len(results), 1)
         
-        # Test 2: Verify fields
+        # Test 2: Result must be a VideoRecord (not a dict)
         video_rec = results[0]
-        self.assertEqual(video_rec["douyin_id"], "123456")
-        self.assertEqual(video_rec["title"], "Test video 1")
+        self.assertIsInstance(video_rec, VideoRecord)
+        self.assertEqual(video_rec.douyin_id, "123456")
+        self.assertEqual(video_rec.title, "Test video 1")
         # Test 3: The highest bitrate URL should have been selected
-        self.assertEqual(video_rec["video_url"], "http://vid.high")
-        self.assertEqual(video_rec["cover_url"], "http://cover.jpg")
+        self.assertEqual(video_rec.video_url, "http://vid.high")
+        self.assertEqual(video_rec.cover_url, "http://cover.jpg")
 
 if __name__ == '__main__':
     unittest.main()
+

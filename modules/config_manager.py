@@ -53,17 +53,17 @@ class ConfigManager:
                 
             path_obj = Path(self.config_file)
             if not path_obj.is_file():
-                logger.critical(f"Configuration file missing or not a file at {self.config_file}")
+                logger.critical("Configuration file missing or not a file at %s", self.config_file)
                 raise ConfigNotFoundError(f"Configuration file not found at {self.config_file}")
             
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except OSError as e:
-                logger.critical(f"OS/Permission error reading config file: {e}")
+                logger.critical("OS/Permission error reading config file: %s", e)
                 raise ConfigParseError(f"File read error: {e}")
             except json.JSONDecodeError as e:
-                logger.critical(f"JSON Parse error in config file: {e}")
+                logger.critical("JSON Parse error in config file: %s", e)
                 raise ConfigParseError(f"Failed to parse JSON configuration: {e}")
 
             if not isinstance(data, dict):

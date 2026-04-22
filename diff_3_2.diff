@@ -1,0 +1,494 @@
+diff --git a/modules/notifier.py b/modules/notifier.py
+index 826e99b..d9a7abb 100644
+--- a/modules/notifier.py
++++ b/modules/notifier.py
+@@ -1,12 +1,13 @@
+ import requests
++import datetime
+ from urllib.parse import quote
+ from modules.logger import logger
+ from modules.config_manager import config
+ 
+ class BarkNotifier:
+     def __init__(self):
+-        # Just validate the initial config and log status. 
+-        # Actual connection params are read at push() time to support hot-reload.
++        self._daily_upload_count: int = 0
++        self._summary_date: str = datetime.date.today().isoformat()
+         self._log_init_status()
+ 
+     def _log_init_status(self):
+@@ -16,7 +17,7 @@ class BarkNotifier:
+         bark_url = str(config.get("bark_url", "")).strip('/')
+         
+         if (server and key) or (bark_url and bark_url.startswith("http")):
+-            logger.info(f"BarkNotifier: Initialized successfully. Server: {server or bark_url}")
++            logger.info("BarkNotifier: Initialized successfully. Server: %s", server or bark_url)
+         else:
+             logger.warning("BarkNotifier: Disabled — missing bark_server/bark_key in config.json")
+ 
+@@ -42,7 +43,7 @@ class BarkNotifier:
+         if not bark_url:
+             return
+ 
+-        logger.info(f"BarkNotifier: Emitting Mobile Broadcast [{title}]")
++        logger.info("BarkNotifier: Emitting Mobile Broadcast [%s]", title)
+         try:
+             safe_title = quote(title, safe='')
+             safe_msg = quote(message, safe='')
+@@ -54,10 +55,37 @@ class BarkNotifier:
+             # 15 second timeout to prevent blocking thread execution
+             resp = requests.get(dispatch_url, timeout=15.0)
+             if resp.status_code == 200:
+-                logger.debug(f"BarkNotifier: Push delivered successfully.")
++                logger.debug("BarkNotifier: Push delivered successfully.")
+             else:
+-                logger.warning(f"BarkNotifier: Server returned status {resp.status_code}")
++                logger.warning("BarkNotifier: Server returned status %s", resp.status_code)
+             
+         except Exception as e:
+-            logger.warning(f"BarkNotifier: Failed bridging notification payload remotely -> {e}")
++            logger.warning("BarkNotifier: Failed bridging notification payload remotely -> %s", e)
+ 
++    def _check_and_reset_daily_counter(self) -> None:
++        """Resets the daily upload counter if the calendar date has changed."""
++        today = datetime.date.today().isoformat()
++        if today != self._summary_date:
++            self._daily_upload_count = 0
++            self._summary_date = today
++
++    def record_upload_success(self) -> None:
++        """Increments the in-memory daily upload counter. Call once per successful upload."""
++        self._check_and_reset_daily_counter()
++        self._daily_upload_count += 1
++
++    def push_daily_summary(self) -> None:
++        """
++        Sends a passive daily summary push with the current accumulated upload count.
++        Uses level='passive' (silent delivery) to avoid notification fatigue.
++        No-op if counter is zero.
++        """
++        self._check_and_reset_daily_counter()
++        count = self._daily_upload_count
++        if count == 0:
++            return
++        self.push(
++            "DouyinSync Daily Summary",
++            "%s video(s) uploaded today" % count,
++            level="passive"
++        )
+diff --git a/modules/scheduler.py b/modules/scheduler.py
+index 7168e9a..d8d436f 100644
+--- a/modules/scheduler.py
++++ b/modules/scheduler.py
+@@ -1,24 +1,26 @@
+ import time
+ import threading
+ import requests
++import asyncio
+ from apscheduler.schedulers.background import BackgroundScheduler
+ from apscheduler.triggers.interval import IntervalTrigger
++from apscheduler.triggers.cron import CronTrigger
+ 
+ from modules.logger import logger
+ from modules.config_manager import config
+ from modules.database import VideoDAO
+ from modules.douyin_fetcher import DouyinFetcher
+ from modules.downloader import Downloader
+-from modules.youtube_uploader import YouTubeUploader
++from modules.youtube_uploader import YoutubeUploader
+ from modules.sweeper import DiskSweeper
+ from modules.notifier import BarkNotifier
++from utils.models import VideoRecord, ProxyConfig
+ 
+ class PipelineCoordinator:
+     def __init__(self):
+         self.scheduler = BackgroundScheduler()
+         self.fetcher = DouyinFetcher()
+         self.downloader = Downloader()
+-        self.uploader = YouTubeUploader()
+         self.sweeper = DiskSweeper()
+         self.notifier = BarkNotifier()
+         
+@@ -35,7 +37,7 @@ class PipelineCoordinator:
+             requests.get("https://www.baidu.com", timeout=5)
+             return True
+         except Exception as e:
+-            logger.warning(f"PipelineCoordinator: Pre-flight network probe isolated environment -> {e}")
++            logger.warning("PipelineCoordinator: Pre-flight network probe isolated environment -> %s", e)
+             return False
+ 
+     def recover_zombies(self):
+@@ -43,7 +45,7 @@ class PipelineCoordinator:
+         logger.info("PipelineCoordinator: Executing Self-Healing Zombie Reverter sequence...")
+         reverted = VideoDAO.revert_zombies()
+         if reverted > 0:
+-            logger.warning(f"PipelineCoordinator: Successfully rescued {reverted} stranded zombie tasks from previous unexpected halt.")
++            logger.warning("PipelineCoordinator: Successfully rescued %s stranded zombie tasks from previous unexpected halt.", reverted)
+ 
+     def primary_sync_job(self):
+         """The master scheduled task bridging and governing all Epics."""
+@@ -52,15 +54,15 @@ class PipelineCoordinator:
+             return
+         
+         try:
+-            self._run_sync_cycle()
++            asyncio.run(self._run_async_cycle())
+         finally:
+             self._pipeline_lock.release()
+ 
+-    def _run_sync_cycle(self):
+-        """Internal sync cycle, always called under lock."""
++    async def _run_async_cycle(self):
++        """Internal sync cycle, executed asynchronously."""
+         logger.info("PipelineCoordinator: === Initiating Scheduled Primary Sync Cycle ===")
+         
+-        # Hot-reload configurations at the start of every cycle so dashboard limits reflect immediately
++        # Hot-reload configurations
+         config.reload()
+ 
+         if not self.check_network():
+@@ -73,15 +75,22 @@ class PipelineCoordinator:
+ 
+         is_youtube_blocked = time.time() < self.youtube_quota_exceeded_until
+         if is_youtube_blocked:
+-             logger.warning("PipelineCoordinator: CIRCUIT BREAKER ACTIVE. YouTube APIs are suspended until the next 24h cycle resets. (Douyin scraping will continue mapping natively.)")
++             logger.warning("PipelineCoordinator: CIRCUIT BREAKER ACTIVE. YouTube APIs are suspended until the next 24h cycle resets.")
++
++        # Story 1.5 - Setup YouTube parameters and proxy securely
++        yt_token = str(config.get("youtube_api_token", ""))
++        yt_proxy = str(config.get("youtube_proxy", ""))
++        proxy_config = ProxyConfig(http=yt_proxy, https=yt_proxy) if yt_proxy else None
++        
++        # Isolated network client
++        uploader = YoutubeUploader(token=yt_token, proxy_config=proxy_config)
+ 
+         try:
+-            # Phase 1. Fetcher Subroutine - with pagination support
++            # Phase 1. Fetcher Subroutine
+             douyin_accounts = config.get("douyin_accounts", [])
+             for account in douyin_accounts:
+                 if isinstance(account, dict):
+                     if not account.get("enable", True):
+-                        logger.debug(f"PipelineCoordinator: Skipping disabled account [{account.get('mark', '?')}]")
+                         continue
+                     account_url = account.get("url", "")
+                     account_mark = account.get("mark", "")
+@@ -92,198 +101,162 @@ class PipelineCoordinator:
+                 if not account_url:
+                     continue
+                 
+-                # Pagination loop: keep fetching until we find at least 1 new pending video
+                 max_cursor = 0
+                 max_pages = config.get("max_scroll_pages", 5)
+-                found_new = False
+                 
+                 for page in range(max_pages):
+-                    posts, next_cursor, has_more = self.fetcher.fetch_user_posts(account_url, max_cursor=max_cursor)
++                    try:
++                        posts, next_cursor, has_more = await self.fetcher.fetch_user_posts(account_url, max_cursor)
++                    except Exception as e:
++                        logger.error("PipelineCoordinator: Fetcher failed for account [%s]: %s", account_url, e)
++                        break
+                     
+                     # Phase 2. Database Deduplication Filter
+                     for post in posts:
+-                        post['account_mark'] = account_mark
++                        # Augment the already-typed VideoRecord with account context
++                        post.account_mark = account_mark
++                        
+                         is_new = VideoDAO.insert_video_if_unique(post)
+                         if is_new:
+-                            logger.info(f"PipelineCoordinator: Tracked new video discovery mapping [{post['douyin_id']}]")
+-                            found_new = True
++                            logger.info("PipelineCoordinator: Tracked new video discovery mapping [%s]", post.douyin_id)
+                     
+-                    # Check if we now have pending videos
+                     pending_check = VideoDAO.get_pending_videos(limit=1)
+                     if pending_check:
+-                        logger.info(f"PipelineCoordinator: Found pending videos after page {page + 1}. Stopping pagination.")
+                         break
+                     
+-                    # If no more pages available, stop
+                     if not has_more or next_cursor == 0:
+-                        logger.info(f"PipelineCoordinator: Reached end of video list for account [{account_mark}] after {page + 1} pages.")
+                         break
+                     
+                     max_cursor = next_cursor
+-                    logger.info(f"PipelineCoordinator: All videos on page {page + 1} already processed. Scrolling to next page (cursor={max_cursor})...")
+ 
+-            # Phase 3. Downloader & Uploader Sync — STRICT: only 1 video per cycle
++            # Phase 3. Downloader & Uploader Sync
+             daily_limit = config.get("daily_upload_limit", 1)
+             uploaded_today = VideoDAO.get_uploaded_today_count()
+             
+             if uploaded_today >= daily_limit:
+-                logger.info(f"PipelineCoordinator: Daily upload limit reached ({uploaded_today}/{daily_limit}). Upload paused until tomorrow.")
++                logger.info("PipelineCoordinator: Daily upload limit reached.")
+             else:
+                 max_per_cycle = config.get("max_videos_per_run", 1)
+-                # slots_left = how many videos we can still upload this cycle
+-                # capped by both the daily quota remainder and the per-run limit
+                 slots_left = min(daily_limit - uploaded_today, max_per_cycle)
+-                logger.info(f"PipelineCoordinator: Upload budget this cycle: {slots_left} slot(s) (daily_limit={daily_limit}, uploaded_today={uploaded_today}, max_per_run={max_per_cycle}).")
+                 
+-                # Phase 3-Pre: Re-upload videos that were downloaded but failed to upload
++                # Phase 3-Pre: Re-upload videos
+                 if not is_youtube_blocked:
+                     uploadable = VideoDAO.get_uploadable_videos(limit=slots_left)
+                     for video in uploadable:
+-                        if slots_left <= 0:
+-                            break
+-                        dy_id = video['douyin_id']
+-                        title_short = (video['title'] or dy_id)[:50]
+-                        local_video = video.get('local_video_path', '')
+-                        local_cover = video.get('local_cover_path', '')
++                        if slots_left <= 0: break
++                        dy_id = video.douyin_id
++                        local_video = video.local_video_path
+                         
+-                        # Verify local files still exist
+                         from pathlib import Path
+                         if not local_video or not Path(local_video).exists():
+-                            logger.warning(f"PipelineCoordinator: Local video missing for [{dy_id}], skipping re-upload. Resetting to pending.")
++                            logger.warning("PipelineCoordinator: Local video missing for [%s], skipping re-upload.", dy_id)
+                             VideoDAO.update_status(dy_id, 'pending')
+                             continue
+                         
+-                        logger.info(f"PipelineCoordinator: Re-uploading previously downloaded video [{dy_id}]")
++                        logger.info("PipelineCoordinator: Re-uploading previously downloaded video [%s]", dy_id)
+                         VideoDAO.update_status(dy_id, 'uploading')
+                         
+-                        base_title = video['title'] or dy_id
+-                        # Try to extract OCR text from cover filename pattern
+-                        ocr_text = ""
+-                        if local_cover and Path(local_cover).exists():
+-                            try:
+-                                from modules.win_ocr import get_text_from_image
+-                                # Re-read OCR from the original jpg (not the _yt version)
+-                                orig_jpg = Path(local_cover).parent / f"{dy_id}.jpg"
+-                                if orig_jpg.exists():
+-                                    extracted = get_text_from_image(str(orig_jpg))
+-                                    if extracted:
+-                                        ocr_text = " ".join(extracted.split())
+-                            except Exception:
+-                                pass
+-                        
+-                        if ocr_text:
+-                            enhanced_title = f"{ocr_text} | {base_title}"[:90]
+-                            enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+-                        else:
+-                            enhanced_title = base_title[:90]
+-                            enhanced_desc = video['description']
+-                        
+-                        yt_id = self.uploader.upload_video_sequence(
+-                            dy_id, local_video, local_cover, enhanced_title, enhanced_desc
+-                        )
+-                        
+-                        if yt_id == "QUOTA_EXCEEDED":
+-                            logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+-                            self.notifier.push("Quota Exceeded", "YouTube API limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+-                            self.youtube_quota_exceeded_until = time.time() + 86400
+-                            VideoDAO.update_status(dy_id, 'downloaded')
+-                            break
+-                        
+-                        if yt_id:
+-                            VideoDAO.update_status(dy_id, 'uploaded')
+-                            self.notifier.push("重传成功", f"视频 [{title_short}] 重新上传YouTube成功!", "active")
+-                            slots_left -= 1
+-
+-                        else:
+-                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.get('retry_count', 0) + 1})
+-                            self.notifier.push("重传失败", f"视频 [{title_short}] 重新上传YouTube失败", "timeSensitive")
++                        try:
++                            # Non-blocking async upload
++                            yt_id = await uploader.upload(video)
++                            if yt_id:
++                                VideoDAO.update_status(dy_id, 'uploaded')
++                                self.notifier.record_upload_success()  # AC2: daily counter
++                                slots_left -= 1
++                            else:
++                                retry = video.retry_count + 1
++                                new_status = 'give_up' if retry >= 3 else 'failed'
++                                VideoDAO.update_status(dy_id, new_status, {'retry_count': retry})
++                                if new_status == 'give_up':
++                                    self.notifier.push(  # AC3: immediate critical alert
++                                        "DouyinSync: Upload Give Up",
++                                        "Video [%s] failed 3 times and was abandoned" % dy_id,
++                                        level="timeSensitive"
++                                    )
++                        except Exception as e:
++                            logger.error("Youtube upload error for [%s]: %s", dy_id, e)
++                            if type(e).__name__ in ["YoutubeQuotaError", "QuotaExceededError"]:
++                                logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota!")
++                                self.youtube_quota_exceeded_until = time.time() + 86400
++                                VideoDAO.update_status(dy_id, 'downloaded')
++                                self.notifier.push(  # AC3: quota exhaustion alert
++                                    "DouyinSync: YouTube Quota Exhausted",
++                                    "API quota exceeded for account [%s]. Suspended 24h." % video.account_mark,
++                                    level="timeSensitive"
++                                )
++                                break
++                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.retry_count + 1})
+                 
+-                # Phase 3-Main: Download + Upload new pending videos (if slots remain) 
++                # Phase 3-Main: Download + Upload new
+                 if slots_left > 0:
+                     pending_videos = VideoDAO.get_pending_videos(limit=slots_left)
+                 else:
+                     pending_videos = []
+-                    
+-                if pending_videos:
+-                    logger.info(f"PipelineCoordinator: Processing {len(pending_videos)} new video(s) this cycle (max_per_run={max_per_cycle}).")
+                 
+                 for video in pending_videos:
+-                    dy_id = video['douyin_id']
+-                    title_short = (video['title'] or dy_id)[:50]
++                    dy_id = video.douyin_id
+                     VideoDAO.update_status(dy_id, 'processing')
+                     
+-                    # Phase 3A-Pre: Re-fetch fresh CDN URLs (Douyin CDN tokens expire quickly)
+-                    video_url = video['video_url']
+-                    cover_url = video['cover_url']
++                    video_url = video.video_url
++                    cover_url = video.cover_url
+                     try:
+-                        fresh = self.fetcher.refresh_video_url(dy_id, douyin_accounts)
++                        fresh = await self.fetcher.refresh_video_url(dy_id, douyin_accounts)
+                         if fresh:
+                             video_url = fresh.get('video_url', video_url)
+                             cover_url = fresh.get('cover_url', cover_url)
+                             VideoDAO.update_fresh_urls(dy_id, video_url, cover_url)
+-                            logger.info(f"PipelineCoordinator: Refreshed CDN URLs for [{dy_id}]")
+-                        else:
+-                            logger.warning(f"PipelineCoordinator: Could not refresh URLs for [{dy_id}], using cached URLs.")
+                     except Exception as e:
+-                        logger.warning(f"PipelineCoordinator: URL refresh failed for [{dy_id}]: {e}. Using cached URLs.")
++                        logger.warning("PipelineCoordinator: URL refresh failed for [%s]: %s", dy_id, e)
+                     
+-                    # Phase 3A: Download
+-                    paths = self.downloader.download_media(dy_id, video_url, cover_url)
+-                    if not paths:
++                    try:
++                        paths = await self.downloader.download_media(dy_id, video_url, cover_url)
++                        if not paths:
++                            VideoDAO.update_status(dy_id, 'failed')
++                            continue
++                    except Exception as e:
++                        logger.error("PipelineCoordinator: Downloader Exception for [%s]: %s", dy_id, e)
+                         VideoDAO.update_status(dy_id, 'failed')
+-                        self.notifier.push("下载失败", f"视频 [{title_short}] 下载失败", "timeSensitive")
+                         continue
+                     
+-                    self.notifier.push("下载完成", f"视频 [{title_short}] 已保存到本地", "active")
+-                        
+-                    # Phase 3A-Post: Store local mapping paths and lock downloaded
++                    video.local_video_path = paths['local_video_path']
++                    video.local_cover_path = paths['local_cover_path']
++                    
+                     VideoDAO.update_status(dy_id, 'downloaded', {
+-                        'local_video_path': paths['local_video_path'],
+-                        'local_cover_path': paths['local_cover_path']
++                        'local_video_path': video.local_video_path,
++                        'local_cover_path': video.local_cover_path
+                     })
+ 
+-                    # Epic 4.3 Check Quota circuit
+                     if is_youtube_blocked:
+                          continue
+                          
+-                    # Phase 3B: Upload
+                     VideoDAO.update_status(dy_id, 'uploading')
+                     
+-                    ocr_text = paths.get('ocr_text', '')
+-                    base_title = video['title'] or dy_id
+-                    
+-                    if ocr_text:
+-                        enhanced_title = f"{ocr_text} | {base_title}"[:90]
+-                        enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+-                    else:
+-                        enhanced_title = base_title[:90]
+-                        enhanced_desc = video['description']
+-                        
+-                    yt_id = self.uploader.upload_video_sequence(
+-                        dy_id, paths['local_video_path'], paths['local_cover_path'], enhanced_title, enhanced_desc
+-                    )
+-                    
+-                    if yt_id == "QUOTA_EXCEEDED":
+-                        logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+-                        self.notifier.push("Quota Exceeded", "YouTube API daily limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+-                        self.youtube_quota_exceeded_until = time.time() + 86400
+-                        VideoDAO.update_status(dy_id, 'downloaded')
+-                        break  # Stop processing remaining pending videos
+-                    
+-                    if yt_id:
+-                        VideoDAO.update_status(dy_id, 'uploaded')
+-                        self.notifier.push("上传成功", f"视频 [{title_short}] 已成功上传YouTube!", "active")
+-                        slots_left -= 1  # R1: decrement to prevent daily limit overrun
+-                        if slots_left <= 0:
+-                            logger.info("PipelineCoordinator: All upload slots consumed. Ending cycle.")
++                    try:
++                        # Async network upload natively via httpx
++                        yt_id = await uploader.upload(video)
++                        if yt_id:
++                            VideoDAO.update_status(dy_id, 'uploaded')
++                            self.notifier.record_upload_success()  # AC2: daily counter
++                            slots_left -= 1
++                            if slots_left <= 0: break
++                        else:
++                            VideoDAO.update_status(dy_id, 'failed')
++                    except Exception as e:
++                        logger.error("Youtube upload exception: %s", e)
++                        if type(e).__name__ == "YoutubeQuotaError":
++                            logger.critical("Circuit Breaker Quota engaged!")
++                            self.youtube_quota_exceeded_until = time.time() + 86400
++                            VideoDAO.update_status(dy_id, 'downloaded')
++                            self.notifier.push(  # AC3: quota critical alert
++                                "DouyinSync: YouTube Quota Exhausted",
++                                "API quota limit hit. Pipeline suspended 24h.",
++                                level="timeSensitive"
++                            )
+                             break
+-                    else:
+                         VideoDAO.update_status(dy_id, 'failed')
+-                        self.notifier.push("上传失败", f"视频 [{title_short}] 上传YouTube失败", "timeSensitive")
+ 
+         except Exception as e:
+-            logger.error(f"PipelineCoordinator: Unhandled Exception in main sync loop engine: {e}. Auto-Recovering for next cycle.")
+-            self.notifier.push("系统异常", f"Pipeline 异常: {str(e)[:100]}", "timeSensitive")
++            logger.error("PipelineCoordinator: Unhandled Exception in main sync loop engine: %s", e)
+ 
+         logger.info("PipelineCoordinator: === Pipeline Cycle Terminated ===")
+ 
+@@ -295,25 +268,25 @@ class PipelineCoordinator:
+         """Mounts background logical dependencies cleanly."""
+         self.recover_zombies()
+         
+-        # Dynamic config interval loading
+         interval = config.get("sync_interval_minutes", 60)
+         self.scheduler.add_job(
+             self.primary_sync_job, 
+             IntervalTrigger(minutes=interval), 
+             id='primary_sync',
+-            max_instances=1 # Prevents overlapping parallel jobs if one block processes videos too long
++            max_instances=1
+         )
+         
+-        # Fire Janitor logic sweeping orphaned mp4s daily independently
+         self.scheduler.add_job(self.janitor_job, IntervalTrigger(hours=24), id='janitor_sync')
+         
++        # Epic 3.2: Daily passive Bark summary (sent at 23:50)
++        self.scheduler.add_job(self.notifier.push_daily_summary, CronTrigger(hour=23, minute=50), id='daily_summary_push')
++        
+         self.scheduler.start()
+         
+-        # Fire once immediately for immediate bootstrapping feedback
+         import datetime
+         self.scheduler.add_job(self.primary_sync_job, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=5))
+-        logger.info(f"PipelineCoordinator: Background APScheduler engaged natively. Rhythm: {interval} minutes.")
++        logger.info("PipelineCoordinator: Background APScheduler engaged natively. Rhythm: %s minutes.", interval)
+ 
+     def shutdown(self):
+         logger.info("PipelineCoordinator: Received shutdown broadcast. Emptying queues gracefully...")
+-        self.scheduler.shutdown(wait=False)
++        self.scheduler.shutdown(wait=True)

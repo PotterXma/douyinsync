@@ -22,16 +22,16 @@ class DiskSweeper:
             total, used, free = shutil.disk_usage(DOWNLOAD_DIR.anchor)
             free_gb = free / (1024**3)
             if free_gb < 2.0:
-                logger.critical(f"DiskSweeper: CRITICAL - Hard drive partition has only {free_gb:.2f}GB remaining! Danger zone.")
+                logger.critical("DiskSweeper: CRITICAL - Hard drive partition has only %.2fGB remaining! Danger zone.", free_gb)
                 return False
             return True
         except Exception as e:
-            logger.warning(f"DiskSweeper: Failed to execute IO disk verification -> {e}")
+            logger.warning("DiskSweeper: Failed to execute IO disk verification -> %s", e)
             return True # Fallback
 
     def purge_stale_media(self, max_age_days: int = 7):
         """Recursively evicts any files aged past the boundary protecting the SSD infrastructure."""
-        logger.info(f"DiskSweeper: Conducting sweep for media older than {max_age_days} days...")
+        logger.info("DiskSweeper: Conducting sweep for media older than %s days...", max_age_days)
         
         cutoff_epoch = time.time() - (max_age_days * 86400)
         reclaimed_bytes = 0
@@ -49,9 +49,9 @@ class DiskSweeper:
                             reclaimed_bytes += size
                             
             if reclaimed_bytes > 0:
-                logger.info(f"DiskSweeper: Janitor operation complete. Reprieved {reclaimed_bytes / (1024**2):.2f} MB of SSD sector space.")
+                logger.info("DiskSweeper: Janitor operation complete. Reprieved %.2f MB of SSD sector space.", reclaimed_bytes / (1024**2))
             else:
                 logger.debug("DiskSweeper: Floors are pristine. No garbage accumulation detected.")
                 
         except Exception as e:
-            logger.error(f"DiskSweeper: Unexpected recursive fault during janitor sequence: {e}")
+            logger.error("DiskSweeper: Unexpected recursive fault during janitor sequence: %s", e)

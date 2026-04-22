@@ -1,12 +1,13 @@
 import requests
+import datetime
 from urllib.parse import quote
 from modules.logger import logger
 from modules.config_manager import config
 
 class BarkNotifier:
     def __init__(self):
-        # Just validate the initial config and log status. 
-        # Actual connection params are read at push() time to support hot-reload.
+        self._daily_upload_count: int = 0
+        self._summary_date: str = datetime.date.today().isoformat()
         self._log_init_status()
 
     def _log_init_status(self):
@@ -16,7 +17,7 @@ class BarkNotifier:
         bark_url = str(config.get("bark_url", "")).strip('/')
         
         if (server and key) or (bark_url and bark_url.startswith("http")):
-            logger.info(f"BarkNotifier: Initialized successfully. Server: {server or bark_url}")
+            logger.info("BarkNotifier: Initialized successfully. Server: %s", server or bark_url)
         else:
             logger.warning("BarkNotifier: Disabled — missing bark_server/bark_key in config.json")
 
@@ -42,7 +43,7 @@ class BarkNotifier:
         if not bark_url:
             return
 
-        logger.info(f"BarkNotifier: Emitting Mobile Broadcast [{title}]")
+        logger.info("BarkNotifier: Emitting Mobile Broadcast [%s]", title)
         try:
             safe_title = quote(title, safe='')
             safe_msg = quote(message, safe='')
@@ -54,10 +55,37 @@ class BarkNotifier:
             # 15 second timeout to prevent blocking thread execution
             resp = requests.get(dispatch_url, timeout=15.0)
             if resp.status_code == 200:
-                logger.debug(f"BarkNotifier: Push delivered successfully.")
+                logger.debug("BarkNotifier: Push delivered successfully.")
             else:
-                logger.warning(f"BarkNotifier: Server returned status {resp.status_code}")
+                logger.warning("BarkNotifier: Server returned status %s", resp.status_code)
             
         except Exception as e:
-            logger.warning(f"BarkNotifier: Failed bridging notification payload remotely -> {e}")
+            logger.warning("BarkNotifier: Failed bridging notification payload remotely -> %s", e)
 
+    def _check_and_reset_daily_counter(self) -> None:
+        """Resets the daily upload counter if the calendar date has changed."""
+        today = datetime.date.today().isoformat()
+        if today != self._summary_date:
+            self._daily_upload_count = 0
+            self._summary_date = today
+
+    def record_upload_success(self) -> None:
+        """Increments the in-memory daily upload counter. Call once per successful upload."""
+        self._check_and_reset_daily_counter()
+        self._daily_upload_count += 1
+
+    def push_daily_summary(self) -> None:
+        """
+        Sends a passive daily summary push with the current accumulated upload count.
+        Uses level='passive' (silent delivery) to avoid notification fatigue.
+        No-op if counter is zero.
+        """
+        self._check_and_reset_daily_counter()
+        count = self._daily_upload_count
+        if count == 0:
+            return
+        self.push(
+            "DouyinSync Daily Summary",
+            "%s video(s) uploaded today" % count,
+            level="passive"
+        )

@@ -1,0 +1,46 @@
+﻿........F...FFFFFF.                                                      [100%]
+================================== FAILURES ===================================
+__________ TestLogSanitizer.test_handles_uninterpolated_args_safely ___________
+tests\test_sanitizer.py:112: in test_handles_uninterpolated_args_safely
+    assert "ya29.aBcDefXYZ1234567890abcdef12" not in record.msg
+E   AssertionError: assert 'ya29.aBcDef...7890abcdef12' not in 'Token ya29....ef12 count=5'
+E     
+E     'ya29.aBcDefXYZ1234567890abcdef12' is contained here:
+E       Token ya29.aBcDefXYZ1234567890abcdef12 count=5
+_________ TestSetupLogging.test_root_logger_has_rotating_file_handler _________
+tests\test_sanitizer.py:157: in test_root_logger_has_rotating_file_handler
+    assert RotatingFileHandler in handler_types
+E   AssertionError: assert <class 'logging.handlers.RotatingFileHandler'> in [<class '_pytest.logging.LogCaptureHandler'>, <class '_pytest.logging.LogCaptureHandler'>]
+____________ TestSetupLogging.test_root_logger_has_stream_handler _____________
+tests\test_sanitizer.py:164: in test_root_logger_has_stream_handler
+    assert logging.StreamHandler in handler_types
+E   AssertionError: assert <class 'logging.StreamHandler'> in [<class '_pytest.logging.LogCaptureHandler'>, <class '_pytest.logging.LogCaptureHandler'>]
+E    +  where <class 'logging.StreamHandler'> = logging.StreamHandler
+____________ TestSetupLogging.test_rotating_file_handler_max_bytes ____________
+tests\test_sanitizer.py:171: in test_rotating_file_handler_max_bytes
+    rfh = next(h for h in root.handlers if isinstance(h, RotatingFileHandler))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   StopIteration
+__________ TestSetupLogging.test_rotating_file_handler_backup_count ___________
+tests\test_sanitizer.py:179: in test_rotating_file_handler_backup_count
+    rfh = next(h for h in root.handlers if isinstance(h, RotatingFileHandler))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   StopIteration
+__________ TestSetupLogging.test_sanitizer_attached_to_file_handler ___________
+tests\test_sanitizer.py:187: in test_sanitizer_attached_to_file_handler
+    rfh = next(h for h in root.handlers if isinstance(h, RotatingFileHandler))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   StopIteration
+_________ TestSetupLogging.test_sanitizer_attached_to_stream_handler __________
+tests\test_sanitizer.py:198: in test_sanitizer_attached_to_stream_handler
+    assert LogSanitizer in filter_types
+E   assert LogSanitizer in []
+=========================== short test summary info ===========================
+FAILED tests/test_sanitizer.py::TestLogSanitizer::test_handles_uninterpolated_args_safely
+FAILED tests/test_sanitizer.py::TestSetupLogging::test_root_logger_has_rotating_file_handler
+FAILED tests/test_sanitizer.py::TestSetupLogging::test_root_logger_has_stream_handler
+FAILED tests/test_sanitizer.py::TestSetupLogging::test_rotating_file_handler_max_bytes
+FAILED tests/test_sanitizer.py::TestSetupLogging::test_rotating_file_handler_backup_count
+FAILED tests/test_sanitizer.py::TestSetupLogging::test_sanitizer_attached_to_file_handler
+FAILED tests/test_sanitizer.py::TestSetupLogging::test_sanitizer_attached_to_stream_handler
+7 failed, 12 passed in 0.21s

@@ -83,5 +83,20 @@ class TestDatabase(unittest.TestCase):
             self.assertEqual(row['local_video_path'], '/fake/path.mp4')
             self.assertIsInstance(row['updated_at'], int)
 
+    def test_get_pipeline_stats(self):
+        test_video1 = VideoRecord(douyin_id="STAT_001", account_mark="A1", status="pending")
+        test_video2 = VideoRecord(douyin_id="STAT_002", account_mark="A2", status="processing")
+        test_video3 = VideoRecord(douyin_id="STAT_003", account_mark="A3", status="uploaded")
+        test_video4 = VideoRecord(douyin_id="STAT_004", account_mark="A4", status="uploaded")
+        VideoDAO.insert_video_if_unique(test_video1)
+        VideoDAO.insert_video_if_unique(test_video2)
+        VideoDAO.insert_video_if_unique(test_video3)
+        VideoDAO.insert_video_if_unique(test_video4)
+
+        stats = VideoDAO.get_pipeline_stats()
+        self.assertEqual(stats.get("pending", 0), 1)
+        self.assertEqual(stats.get("processing", 0), 1)
+        self.assertEqual(stats.get("uploaded", 0), 2)
+
 if __name__ == '__main__':
     unittest.main()

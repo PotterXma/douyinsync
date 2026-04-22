@@ -1,0 +1,1042 @@
+﻿diff --git a/modules/douyin_fetcher.py b/modules/douyin_fetcher.py
+index d5f1372..52560bb 100644
+--- a/modules/douyin_fetcher.py
++++ b/modules/douyin_fetcher.py
+@@ -1,9 +1,12 @@
+ import requests
+ import json
+ from urllib.parse import urlparse, urlencode, quote
++from typing import List, Tuple, Optional
++
+ from modules.logger import logger
+ from modules.config_manager import config
+ from modules.abogus import ABogus, USERAGENT
++from utils.models import VideoRecord
+ 
+ class DouyinFetcher:
+     def __init__(self):
+@@ -21,19 +24,19 @@ class DouyinFetcher:
+             return {"Cookie": cookie}
+         return {}
+ 
+-    def fetch_user_posts(self, user_url: str, max_cursor: int = 0) -> tuple:
++    def fetch_user_posts(self, user_url: str, max_cursor: int = 0) -> Tuple[List[VideoRecord], int, bool]:
+         """
+         Parses profile to get videos with pagination support.
+         Returns tuple of (posts_list, next_cursor, has_more).
+         """
+-        logger.info(f"DouyinFetcher: Initiating scrape for URL -> {user_url} (cursor={max_cursor})")
++        logger.info("DouyinFetcher: Initiating scrape for URL -> %s (cursor=%s)", user_url, max_cursor)
+         
+         current_headers = self.headers.copy()
+         current_headers.update(self._get_cookie_header())
+         
+         sec_user_id = self._extract_sec_user_id(user_url)
+         if not sec_user_id:
+-            logger.error(f"DouyinFetcher: Could not extract valid sec_user_id from {user_url}")
++            logger.error("DouyinFetcher: Could not extract valid sec_user_id from %s", user_url)
+             return [], 0, False
+             
+         # Use exact endpoint mapping
+@@ -100,10 +103,10 @@ class DouyinFetcher:
+             
+             return posts, next_cursor, has_more
+         except requests.RequestException as e:
+-            logger.error(f"DouyinFetcher: Network error during fetch. {e}")
++            logger.error("DouyinFetcher: Network error during fetch. %s", e)
+             return [], 0, False
+         except Exception as e:
+-            logger.error(f"DouyinFetcher: Exception during fetch payload parsing: {e}")
++            logger.error("DouyinFetcher: Exception during fetch payload parsing: %s", e)
+             return [], 0, False
+ 
+     def _extract_sec_user_id(self, url: str) -> str:
+@@ -116,12 +119,12 @@ class DouyinFetcher:
+                 if idx + 1 < len(parts):
+                     return parts[idx + 1]
+         except Exception as e:
+-            logger.debug(f"Failed to URL-parse {url}: {e}")
++            logger.debug("Failed to URL-parse %s: %s", url, e)
+         return ""
+ 
+-    def _parse_video_list(self, json_data: dict) -> list:
+-        """Safely distills Douyin JSON into generic pipeline dict metadata."""
+-        results = []
++    def _parse_video_list(self, json_data: dict) -> List[VideoRecord]:
++        """Safely distills Douyin JSON into strongly-typed VideoRecord instances."""
++        results: List[VideoRecord] = []
+         if not isinstance(json_data, dict):
+             logger.warning("DouyinFetcher: Invalid JSON payload root format.")
+             return results
+@@ -134,7 +137,7 @@ class DouyinFetcher:
+         for item in aweme_list:
+             # Filter Layer: Discard Tuwen (Image posts) protecting downstream YouTube Uploader
+             if item.get("images") is not None or item.get("aweme_type") == 68:
+-                logger.debug(f"DouyinFetcher: Filtering out unsupported Image-Post. ID: {item.get('aweme_id')}")
++                logger.debug("DouyinFetcher: Filtering out unsupported Image-Post. ID: %s", item.get('aweme_id'))
+                 continue
+                 
+             try:
+@@ -163,21 +166,21 @@ class DouyinFetcher:
+                 cover_addr = video_info.get("cover", {}).get("url_list", [])
+                 cover_url = cover_addr[0] if cover_addr else ""
+                 
+-                results.append({
+-                    "douyin_id": str(douyin_id),
+-                    "title": title[:300], # Soft fail-safe limit
+-                    "description": title,
+-                    "video_url": video_url,
+-                    "cover_url": cover_url
+-                })
++                results.append(VideoRecord(
++                    douyin_id=str(douyin_id),
++                    title=title[:300],       # Soft fail-safe limit
++                    description=title,
++                    video_url=video_url,
++                    cover_url=cover_url,
++                ))
+             except KeyError as e:
+-                logger.debug(f"DouyinFetcher: Skipped item missing fundamental keys {e}")
++                logger.debug("DouyinFetcher: Skipped item missing fundamental keys %s", e)
+                 continue
+                 
+-        logger.info(f"DouyinFetcher: Successfully processed {len(results)} valid video records.")
++        logger.info("DouyinFetcher: Successfully processed %s valid video records.", len(results))
+         return results
+ 
+-    def refresh_video_url(self, douyin_id: str, accounts: list) -> dict:
++    def refresh_video_url(self, douyin_id: str, accounts: list) -> Optional[dict]:
+         """
+         Re-fetches the video list from the API and finds a matching video_id 
+         to obtain a fresh CDN URL with valid time-based tokens.
+@@ -201,16 +204,16 @@ class DouyinFetcher:
+                 for _page in range(3):
+                     posts, next_cursor, has_more = self.fetch_user_posts(account_url, max_cursor=cursor)
+                     for post in posts:
+-                        if post.get("douyin_id") == douyin_id:
++                        if post.douyin_id == douyin_id:
+                             return {
+-                                "video_url": post.get("video_url", ""),
+-                                "cover_url": post.get("cover_url", "")
++                                "video_url": post.video_url,
++                                "cover_url": post.cover_url
+                             }
+                     if not has_more or next_cursor == 0:
+                         break
+                     cursor = next_cursor
+             except Exception as e:
+-                logger.warning(f"DouyinFetcher: Error refreshing URL for {douyin_id}: {e}")
++                logger.warning("DouyinFetcher: Error refreshing URL for %s: %s", douyin_id, e)
+                 continue
+         
+         return None
+diff --git a/modules/scheduler.py b/modules/scheduler.py
+index 7168e9a..21ccdb3 100644
+--- a/modules/scheduler.py
++++ b/modules/scheduler.py
+@@ -1,6 +1,7 @@
+ import time
+ import threading
+ import requests
++import asyncio
+ from apscheduler.schedulers.background import BackgroundScheduler
+ from apscheduler.triggers.interval import IntervalTrigger
+ 
+@@ -9,16 +10,16 @@ from modules.config_manager import config
+ from modules.database import VideoDAO
+ from modules.douyin_fetcher import DouyinFetcher
+ from modules.downloader import Downloader
+-from modules.youtube_uploader import YouTubeUploader
++from modules.youtube_uploader import YoutubeUploader
+ from modules.sweeper import DiskSweeper
+ from modules.notifier import BarkNotifier
++from utils.models import VideoRecord, ProxyConfig
+ 
+ class PipelineCoordinator:
+     def __init__(self):
+         self.scheduler = BackgroundScheduler()
+         self.fetcher = DouyinFetcher()
+         self.downloader = Downloader()
+-        self.uploader = YouTubeUploader()
+         self.sweeper = DiskSweeper()
+         self.notifier = BarkNotifier()
+         
+@@ -35,7 +36,7 @@ class PipelineCoordinator:
+             requests.get("https://www.baidu.com", timeout=5)
+             return True
+         except Exception as e:
+-            logger.warning(f"PipelineCoordinator: Pre-flight network probe isolated environment -> {e}")
++            logger.warning("PipelineCoordinator: Pre-flight network probe isolated environment -> %s", e)
+             return False
+ 
+     def recover_zombies(self):
+@@ -43,7 +44,7 @@ class PipelineCoordinator:
+         logger.info("PipelineCoordinator: Executing Self-Healing Zombie Reverter sequence...")
+         reverted = VideoDAO.revert_zombies()
+         if reverted > 0:
+-            logger.warning(f"PipelineCoordinator: Successfully rescued {reverted} stranded zombie tasks from previous unexpected halt.")
++            logger.warning("PipelineCoordinator: Successfully rescued %s stranded zombie tasks from previous unexpected halt.", reverted)
+ 
+     def primary_sync_job(self):
+         """The master scheduled task bridging and governing all Epics."""
+@@ -52,15 +53,15 @@ class PipelineCoordinator:
+             return
+         
+         try:
+-            self._run_sync_cycle()
++            asyncio.run(self._run_async_cycle())
+         finally:
+             self._pipeline_lock.release()
+ 
+-    def _run_sync_cycle(self):
+-        """Internal sync cycle, always called under lock."""
++    async def _run_async_cycle(self):
++        """Internal sync cycle, executed asynchronously."""
+         logger.info("PipelineCoordinator: === Initiating Scheduled Primary Sync Cycle ===")
+         
+-        # Hot-reload configurations at the start of every cycle so dashboard limits reflect immediately
++        # Hot-reload configurations
+         config.reload()
+ 
+         if not self.check_network():
+@@ -73,15 +74,22 @@ class PipelineCoordinator:
+ 
+         is_youtube_blocked = time.time() < self.youtube_quota_exceeded_until
+         if is_youtube_blocked:
+-             logger.warning("PipelineCoordinator: CIRCUIT BREAKER ACTIVE. YouTube APIs are suspended until the next 24h cycle resets. (Douyin scraping will continue mapping natively.)")
++             logger.warning("PipelineCoordinator: CIRCUIT BREAKER ACTIVE. YouTube APIs are suspended until the next 24h cycle resets.")
++
++        # Story 1.5 - Setup YouTube parameters and proxy securely
++        yt_token = str(config.get("youtube_api_token", ""))
++        yt_proxy = str(config.get("youtube_proxy", ""))
++        proxy_config = ProxyConfig(http=yt_proxy, https=yt_proxy) if yt_proxy else None
++        
++        # Isolated network client
++        uploader = YoutubeUploader(token=yt_token, proxy_config=proxy_config)
+ 
+         try:
+-            # Phase 1. Fetcher Subroutine - with pagination support
++            # Phase 1. Fetcher Subroutine
+             douyin_accounts = config.get("douyin_accounts", [])
+             for account in douyin_accounts:
+                 if isinstance(account, dict):
+                     if not account.get("enable", True):
+-                        logger.debug(f"PipelineCoordinator: Skipping disabled account [{account.get('mark', '?')}]")
+                         continue
+                     account_url = account.get("url", "")
+                     account_mark = account.get("mark", "")
+@@ -92,198 +100,135 @@ class PipelineCoordinator:
+                 if not account_url:
+                     continue
+                 
+-                # Pagination loop: keep fetching until we find at least 1 new pending video
+                 max_cursor = 0
+                 max_pages = config.get("max_scroll_pages", 5)
+-                found_new = False
+                 
+                 for page in range(max_pages):
+-                    posts, next_cursor, has_more = self.fetcher.fetch_user_posts(account_url, max_cursor=max_cursor)
++                    # Offload blocking request to thread
++                    posts, next_cursor, has_more = await asyncio.to_thread(self.fetcher.fetch_user_posts, account_url, max_cursor)
+                     
+                     # Phase 2. Database Deduplication Filter
+                     for post in posts:
+-                        post['account_mark'] = account_mark
++                        # Augment the already-typed VideoRecord with account context
++                        post.account_mark = account_mark
++                        
+                         is_new = VideoDAO.insert_video_if_unique(post)
+                         if is_new:
+-                            logger.info(f"PipelineCoordinator: Tracked new video discovery mapping [{post['douyin_id']}]")
+-                            found_new = True
++                            logger.info("PipelineCoordinator: Tracked new video discovery mapping [%s]", post.douyin_id)
+                     
+-                    # Check if we now have pending videos
+                     pending_check = VideoDAO.get_pending_videos(limit=1)
+                     if pending_check:
+-                        logger.info(f"PipelineCoordinator: Found pending videos after page {page + 1}. Stopping pagination.")
+                         break
+                     
+-                    # If no more pages available, stop
+                     if not has_more or next_cursor == 0:
+-                        logger.info(f"PipelineCoordinator: Reached end of video list for account [{account_mark}] after {page + 1} pages.")
+                         break
+                     
+                     max_cursor = next_cursor
+-                    logger.info(f"PipelineCoordinator: All videos on page {page + 1} already processed. Scrolling to next page (cursor={max_cursor})...")
+ 
+-            # Phase 3. Downloader & Uploader Sync 鈥?STRICT: only 1 video per cycle
++            # Phase 3. Downloader & Uploader Sync
+             daily_limit = config.get("daily_upload_limit", 1)
+             uploaded_today = VideoDAO.get_uploaded_today_count()
+             
+             if uploaded_today >= daily_limit:
+-                logger.info(f"PipelineCoordinator: Daily upload limit reached ({uploaded_today}/{daily_limit}). Upload paused until tomorrow.")
++                logger.info("PipelineCoordinator: Daily upload limit reached.")
+             else:
+                 max_per_cycle = config.get("max_videos_per_run", 1)
+-                # slots_left = how many videos we can still upload this cycle
+-                # capped by both the daily quota remainder and the per-run limit
+                 slots_left = min(daily_limit - uploaded_today, max_per_cycle)
+-                logger.info(f"PipelineCoordinator: Upload budget this cycle: {slots_left} slot(s) (daily_limit={daily_limit}, uploaded_today={uploaded_today}, max_per_run={max_per_cycle}).")
+                 
+-                # Phase 3-Pre: Re-upload videos that were downloaded but failed to upload
++                # Phase 3-Pre: Re-upload videos
+                 if not is_youtube_blocked:
+                     uploadable = VideoDAO.get_uploadable_videos(limit=slots_left)
+                     for video in uploadable:
+-                        if slots_left <= 0:
+-                            break
+-                        dy_id = video['douyin_id']
+-                        title_short = (video['title'] or dy_id)[:50]
+-                        local_video = video.get('local_video_path', '')
+-                        local_cover = video.get('local_cover_path', '')
++                        if slots_left <= 0: break
++                        dy_id = video.douyin_id
++                        local_video = video.local_video_path
+                         
+-                        # Verify local files still exist
+                         from pathlib import Path
+                         if not local_video or not Path(local_video).exists():
+-                            logger.warning(f"PipelineCoordinator: Local video missing for [{dy_id}], skipping re-upload. Resetting to pending.")
++                            logger.warning("PipelineCoordinator: Local video missing for [%s], skipping re-upload.", dy_id)
+                             VideoDAO.update_status(dy_id, 'pending')
+                             continue
+                         
+-                        logger.info(f"PipelineCoordinator: Re-uploading previously downloaded video [{dy_id}]")
++                        logger.info("PipelineCoordinator: Re-uploading previously downloaded video [%s]", dy_id)
+                         VideoDAO.update_status(dy_id, 'uploading')
+                         
+-                        base_title = video['title'] or dy_id
+-                        # Try to extract OCR text from cover filename pattern
+-                        ocr_text = ""
+-                        if local_cover and Path(local_cover).exists():
+-                            try:
+-                                from modules.win_ocr import get_text_from_image
+-                                # Re-read OCR from the original jpg (not the _yt version)
+-                                orig_jpg = Path(local_cover).parent / f"{dy_id}.jpg"
+-                                if orig_jpg.exists():
+-                                    extracted = get_text_from_image(str(orig_jpg))
+-                                    if extracted:
+-                                        ocr_text = " ".join(extracted.split())
+-                            except Exception:
+-                                pass
+-                        
+-                        if ocr_text:
+-                            enhanced_title = f"{ocr_text} | {base_title}"[:90]
+-                            enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+-                        else:
+-                            enhanced_title = base_title[:90]
+-                            enhanced_desc = video['description']
+-                        
+-                        yt_id = self.uploader.upload_video_sequence(
+-                            dy_id, local_video, local_cover, enhanced_title, enhanced_desc
+-                        )
+-                        
+-                        if yt_id == "QUOTA_EXCEEDED":
+-                            logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+-                            self.notifier.push("Quota Exceeded", "YouTube API limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+-                            self.youtube_quota_exceeded_until = time.time() + 86400
+-                            VideoDAO.update_status(dy_id, 'downloaded')
+-                            break
+-                        
+-                        if yt_id:
+-                            VideoDAO.update_status(dy_id, 'uploaded')
+-                            self.notifier.push("閲嶄紶鎴愬姛", f"瑙嗛 [{title_short}] 閲嶆柊涓婁紶YouTube鎴愬姛!", "active")
+-                            slots_left -= 1
+-
+-                        else:
+-                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.get('retry_count', 0) + 1})
+-                            self.notifier.push("閲嶄紶澶辫触", f"瑙嗛 [{title_short}] 閲嶆柊涓婁紶YouTube澶辫触", "timeSensitive")
++                        try:
++                            # Non-blocking async upload
++                            yt_id = await uploader.upload(video)
++                            if yt_id:
++                                VideoDAO.update_status(dy_id, 'uploaded')
++                                slots_left -= 1
++                            else:
++                                VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.retry_count + 1})
++                        except Exception as e:
++                            logger.error("Youtube upload error for [%s]: %s", dy_id, e)
++                            if type(e).__name__ in ["YoutubeQuotaError", "QuotaExceededError"]:
++                                logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota!")
++                                self.youtube_quota_exceeded_until = time.time() + 86400
++                                VideoDAO.update_status(dy_id, 'downloaded')
++                                break
++                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.retry_count + 1})
+                 
+-                # Phase 3-Main: Download + Upload new pending videos (if slots remain) 
++                # Phase 3-Main: Download + Upload new
+                 if slots_left > 0:
+                     pending_videos = VideoDAO.get_pending_videos(limit=slots_left)
+                 else:
+                     pending_videos = []
+-                    
+-                if pending_videos:
+-                    logger.info(f"PipelineCoordinator: Processing {len(pending_videos)} new video(s) this cycle (max_per_run={max_per_cycle}).")
+                 
+                 for video in pending_videos:
+-                    dy_id = video['douyin_id']
+-                    title_short = (video['title'] or dy_id)[:50]
++                    dy_id = video.douyin_id
+                     VideoDAO.update_status(dy_id, 'processing')
+                     
+-                    # Phase 3A-Pre: Re-fetch fresh CDN URLs (Douyin CDN tokens expire quickly)
+-                    video_url = video['video_url']
+-                    cover_url = video['cover_url']
++                    video_url = video.video_url
++                    cover_url = video.cover_url
+                     try:
+-                        fresh = self.fetcher.refresh_video_url(dy_id, douyin_accounts)
++                        fresh = await asyncio.to_thread(self.fetcher.refresh_video_url, dy_id, douyin_accounts)
+                         if fresh:
+                             video_url = fresh.get('video_url', video_url)
+                             cover_url = fresh.get('cover_url', cover_url)
+                             VideoDAO.update_fresh_urls(dy_id, video_url, cover_url)
+-                            logger.info(f"PipelineCoordinator: Refreshed CDN URLs for [{dy_id}]")
+-                        else:
+-                            logger.warning(f"PipelineCoordinator: Could not refresh URLs for [{dy_id}], using cached URLs.")
+                     except Exception as e:
+-                        logger.warning(f"PipelineCoordinator: URL refresh failed for [{dy_id}]: {e}. Using cached URLs.")
++                        logger.warning("PipelineCoordinator: URL refresh failed for [%s]: %s", dy_id, e)
+                     
+-                    # Phase 3A: Download
+-                    paths = self.downloader.download_media(dy_id, video_url, cover_url)
++                    # Async thread block wrapper
++                    paths = await asyncio.to_thread(self.downloader.download_media, dy_id, video_url, cover_url)
+                     if not paths:
+                         VideoDAO.update_status(dy_id, 'failed')
+-                        self.notifier.push("涓嬭浇澶辫触", f"瑙嗛 [{title_short}] 涓嬭浇澶辫触", "timeSensitive")
+                         continue
+                     
+-                    self.notifier.push("涓嬭浇瀹屾垚", f"瑙嗛 [{title_short}] 宸蹭繚瀛樺埌鏈湴", "active")
+-                        
+-                    # Phase 3A-Post: Store local mapping paths and lock downloaded
++                    video.local_video_path = paths['local_video_path']
++                    video.local_cover_path = paths['local_cover_path']
++                    
+                     VideoDAO.update_status(dy_id, 'downloaded', {
+-                        'local_video_path': paths['local_video_path'],
+-                        'local_cover_path': paths['local_cover_path']
++                        'local_video_path': video.local_video_path,
++                        'local_cover_path': video.local_cover_path
+                     })
+ 
+-                    # Epic 4.3 Check Quota circuit
+                     if is_youtube_blocked:
+                          continue
+                          
+-                    # Phase 3B: Upload
+                     VideoDAO.update_status(dy_id, 'uploading')
+                     
+-                    ocr_text = paths.get('ocr_text', '')
+-                    base_title = video['title'] or dy_id
+-                    
+-                    if ocr_text:
+-                        enhanced_title = f"{ocr_text} | {base_title}"[:90]
+-                        enhanced_desc = f"{video['description']}\n\n[OCR Data: {ocr_text}]"
+-                    else:
+-                        enhanced_title = base_title[:90]
+-                        enhanced_desc = video['description']
+-                        
+-                    yt_id = self.uploader.upload_video_sequence(
+-                        dy_id, paths['local_video_path'], paths['local_cover_path'], enhanced_title, enhanced_desc
+-                    )
+-                    
+-                    if yt_id == "QUOTA_EXCEEDED":
+-                        logger.critical("PipelineCoordinator: Engaged Hard Circuit Breaker (24h block) for YouTube Quota Limits!")
+-                        self.notifier.push("Quota Exceeded", "YouTube API daily limitation reached. Circuit Breaker locked for 24h.", "timeSensitive")
+-                        self.youtube_quota_exceeded_until = time.time() + 86400
+-                        VideoDAO.update_status(dy_id, 'downloaded')
+-                        break  # Stop processing remaining pending videos
+-                    
+-                    if yt_id:
+-                        VideoDAO.update_status(dy_id, 'uploaded')
+-                        self.notifier.push("涓婁紶鎴愬姛", f"瑙嗛 [{title_short}] 宸叉垚鍔熶笂浼燳ouTube!", "active")
+-                        slots_left -= 1  # R1: decrement to prevent daily limit overrun
+-                        if slots_left <= 0:
+-                            logger.info("PipelineCoordinator: All upload slots consumed. Ending cycle.")
++                    try:
++                        # Async network upload natively via httpx
++                        yt_id = await uploader.upload(video)
++                        if yt_id:
++                            VideoDAO.update_status(dy_id, 'uploaded')
++                            slots_left -= 1
++                            if slots_left <= 0: break
++                        else:
++                            VideoDAO.update_status(dy_id, 'failed')
++                    except Exception as e:
++                        logger.error("Youtube upload exception: %s", e)
++                        if type(e).__name__ == "YoutubeQuotaError":
++                            logger.critical("Circuit Breaker Quota engaged!")
++                            self.youtube_quota_exceeded_until = time.time() + 86400
++                            VideoDAO.update_status(dy_id, 'downloaded')
+                             break
+-                    else:
+                         VideoDAO.update_status(dy_id, 'failed')
+-                        self.notifier.push("涓婁紶澶辫触", f"瑙嗛 [{title_short}] 涓婁紶YouTube澶辫触", "timeSensitive")
+ 
+         except Exception as e:
+-            logger.error(f"PipelineCoordinator: Unhandled Exception in main sync loop engine: {e}. Auto-Recovering for next cycle.")
+-            self.notifier.push("绯荤粺寮傚父", f"Pipeline 寮傚父: {str(e)[:100]}", "timeSensitive")
++            logger.error("PipelineCoordinator: Unhandled Exception in main sync loop engine: %s", e)
+ 
+         logger.info("PipelineCoordinator: === Pipeline Cycle Terminated ===")
+ 
+@@ -295,24 +240,20 @@ class PipelineCoordinator:
+         """Mounts background logical dependencies cleanly."""
+         self.recover_zombies()
+         
+-        # Dynamic config interval loading
+         interval = config.get("sync_interval_minutes", 60)
+         self.scheduler.add_job(
+             self.primary_sync_job, 
+             IntervalTrigger(minutes=interval), 
+             id='primary_sync',
+-            max_instances=1 # Prevents overlapping parallel jobs if one block processes videos too long
++            max_instances=1
+         )
+         
+-        # Fire Janitor logic sweeping orphaned mp4s daily independently
+         self.scheduler.add_job(self.janitor_job, IntervalTrigger(hours=24), id='janitor_sync')
+-        
+         self.scheduler.start()
+         
+-        # Fire once immediately for immediate bootstrapping feedback
+         import datetime
+         self.scheduler.add_job(self.primary_sync_job, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=5))
+-        logger.info(f"PipelineCoordinator: Background APScheduler engaged natively. Rhythm: {interval} minutes.")
++        logger.info("PipelineCoordinator: Background APScheduler engaged natively. Rhythm: %s minutes.", interval)
+ 
+     def shutdown(self):
+         logger.info("PipelineCoordinator: Received shutdown broadcast. Emptying queues gracefully...")
+diff --git a/tests/test_douyin_fetcher.py b/tests/test_douyin_fetcher.py
+index 59c429c..f6b9e64 100644
+--- a/tests/test_douyin_fetcher.py
++++ b/tests/test_douyin_fetcher.py
+@@ -1,22 +1,23 @@
+ import unittest
+ from modules.douyin_fetcher import DouyinFetcher
++from utils.models import VideoRecord
+ 
+ class TestDouyinFetcher(unittest.TestCase):
+-    def setUp(self):
++    def setUp(self) -> None:
+         self.fetcher = DouyinFetcher()
+         
+-    def test_extract_sec_user_id_success(self):
++    def test_extract_sec_user_id_success(self) -> None:
+         url = "https://www.douyin.com/user/MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7"
+         sec_user_id = self.fetcher._extract_sec_user_id(url)
+         self.assertEqual(sec_user_id, "MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7")
+         
+-    def test_extract_sec_user_id_fail(self):
++    def test_extract_sec_user_id_fail(self) -> None:
+         # A malformed or different URL
+         url = "https://www.douyin.com/notuser/MS4wL"
+         sec_user_id = self.fetcher._extract_sec_user_id(url)
+         self.assertEqual(sec_user_id, "")
+         
+-    def test_parse_video_list_valid_payload(self):
++    def test_parse_video_list_valid_payload(self) -> None:
+         mock_payload = {
+             "aweme_list": [
+                 {
+@@ -43,13 +44,15 @@ class TestDouyinFetcher(unittest.TestCase):
+         # Test 1: Only the video post should be parsed (image post filtered)
+         self.assertEqual(len(results), 1)
+         
+-        # Test 2: Verify fields
++        # Test 2: Result must be a VideoRecord (not a dict)
+         video_rec = results[0]
+-        self.assertEqual(video_rec["douyin_id"], "123456")
+-        self.assertEqual(video_rec["title"], "Test video 1")
++        self.assertIsInstance(video_rec, VideoRecord)
++        self.assertEqual(video_rec.douyin_id, "123456")
++        self.assertEqual(video_rec.title, "Test video 1")
+         # Test 3: The highest bitrate URL should have been selected
+-        self.assertEqual(video_rec["video_url"], "http://vid.high")
+-        self.assertEqual(video_rec["cover_url"], "http://cover.jpg")
++        self.assertEqual(video_rec.video_url, "http://vid.high")
++        self.assertEqual(video_rec.cover_url, "http://cover.jpg")
+ 
+ if __name__ == '__main__':
+     unittest.main()
++
+diff --git a/utils/decorators.py b/utils/decorators.py
+new file mode 100644
+index 0000000..180bc6a
+--- /dev/null
++++ b/utils/decorators.py
+@@ -0,0 +1,132 @@
++"""
++utils/decorators.py
++
++Retry and circuit-breaker decorators for external network operations.
++These are sync-compatible and wrap both sync and async callable patterns.
++"""
++import time
++import asyncio
++import functools
++import logging
++import datetime
++from typing import Callable, Tuple, Type
++
++logger = logging.getLogger(__name__)
++
++# Maximum retry attempts before a give_up state is assigned
++MAX_RETRY_ATTEMPTS = 3
++
++
++def auto_retry(
++    max_retries: int = MAX_RETRY_ATTEMPTS,
++    backoff_base: float = 2.0,
++    exceptions: Tuple[Type[Exception], ...] = (Exception,),
++) -> Callable:
++    """
++    Decorator: Retries the wrapped function with exponential backoff on failure.
++    After max_retries exhausted, the final exception is re-raised.
++
++    Usage:
++        @auto_retry(max_retries=3, exceptions=(NetworkTimeoutError,))
++        async def fetch_something(url: str) -> dict:
++            ...
++    """
++    def decorator(func: Callable) -> Callable:
++        if asyncio.iscoroutinefunction(func):
++            @functools.wraps(func)
++            async def async_wrapper(*args, **kwargs):
++                last_exc = None
++                for attempt in range(max_retries):
++                    try:
++                        return await func(*args, **kwargs)
++                    except exceptions as exc:
++                        last_exc = exc
++                        sleep_time = backoff_base ** attempt
++                        logger.warning(
++                            "auto_retry: attempt %s/%s failed for %s \u2014 %s. Retrying in %.1fs...",
++                            attempt + 1, max_retries, func.__name__, exc, sleep_time
++                        )
++                        if attempt < max_retries - 1:
++                            await asyncio.sleep(sleep_time)
++                logger.error(
++                    "auto_retry: %s exhausted all %s retries. Final error: %s",
++                    func.__name__, max_retries, last_exc
++                )
++                raise last_exc
++            return async_wrapper
++        else:
++            @functools.wraps(func)
++            def sync_wrapper(*args, **kwargs):
++                last_exc = None
++                for attempt in range(max_retries):
++                    try:
++                        return func(*args, **kwargs)
++                    except exceptions as exc:
++                        last_exc = exc
++                        sleep_time = backoff_base ** attempt
++                        logger.warning(
++                            "auto_retry: attempt %s/%s failed for %s \u2014 %s. Retrying in %.1fs...",
++                            attempt + 1, max_retries, func.__name__, exc, sleep_time
++                        )
++                        if attempt < max_retries - 1:
++                            time.sleep(sleep_time)
++                logger.error(
++                    "auto_retry: %s exhausted all %s retries. Final error: %s",
++                    func.__name__, max_retries, last_exc
++                )
++                raise last_exc
++            return sync_wrapper
++    return decorator
++
++
++def _get_seconds_until_midnight_pst() -> float:
++    """Helper to calculate seconds until next midnight PST."""
++    now = datetime.datetime.now(datetime.timezone.utc)
++    # PST is UTC-8
++    pst_tz = datetime.timezone(datetime.timedelta(hours=-8))
++    now_pst = now.astimezone(pst_tz)
++    tomorrow_pst = now_pst + datetime.timedelta(days=1)
++    midnight_pst = datetime.datetime(tomorrow_pst.year, tomorrow_pst.month, tomorrow_pst.day, tzinfo=pst_tz)
++    return (midnight_pst - now).total_seconds()
++
++
++def circuit_breaker(
++    trip_on: Tuple[Type[Exception], ...] = (Exception,),
++) -> Callable:
++    """
++    Decorator: Trips immediately on the specified exception types, signaling
++    quota-exhaustion or hard-block scenarios without retry.
++    Forcefully suspends execution until the next chronological reset period.
++    """
++    def decorator(func: Callable) -> Callable:
++        if asyncio.iscoroutinefunction(func):
++            @functools.wraps(func)
++            async def async_wrapper(*args, **kwargs):
++                try:
++                    return await func(*args, **kwargs)
++                except trip_on as exc:
++                    logger.error(
++                        "circuit_breaker: TRIPPED on %s in %s \u2014 %s. Operation suspended.",
++                        type(exc).__name__, func.__name__, exc
++                    )
++                    sleep_time = _get_seconds_until_midnight_pst()
++                    logger.warning("circuit_breaker: Sleeping for %.1f seconds until midnight PST...", sleep_time)
++                    await asyncio.sleep(sleep_time)
++                    raise
++            return async_wrapper
++        else:
++            @functools.wraps(func)
++            def sync_wrapper(*args, **kwargs):
++                try:
++                    return func(*args, **kwargs)
++                except trip_on as exc:
++                    logger.error(
++                        "circuit_breaker: TRIPPED on %s in %s \u2014 %s. Operation suspended.",
++                        type(exc).__name__, func.__name__, exc
++                    )
++                    sleep_time = _get_seconds_until_midnight_pst()
++                    logger.warning("circuit_breaker: Sleeping for %.1f seconds until midnight PST...", sleep_time)
++                    time.sleep(sleep_time)
++                    raise
++            return sync_wrapper
++    return decorator
+diff --git a/tests/test_douyin_api.py b/tests/test_douyin_api.py
+new file mode 100644
+index 0000000..c77fb56
+--- /dev/null
++++ b/tests/test_douyin_api.py
+@@ -0,0 +1,177 @@
++"""
++tests/test_douyin_api.py
++
++Unit tests for modules/douyin_fetcher.py.
++Validates that DouyinFetcher._parse_video_list returns strongly-typed
++VideoRecord instances and that sec_user_id extraction works correctly.
++All tests are synchronous and use unittest (matching project conventions).
++"""
++import unittest
++from modules.douyin_fetcher import DouyinFetcher
++from utils.models import VideoRecord
++
++
++class TestDouyinFetcher(unittest.TestCase):
++    def setUp(self) -> None:
++        self.fetcher = DouyinFetcher()
++
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++    # sec_user_id extraction
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++
++    def test_extract_sec_user_id_success(self) -> None:
++        """Valid profile URL must yield the sec_user_id path segment."""
++        url = (
++            "https://www.douyin.com/user/"
++            "MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7"
++        )
++        result = self.fetcher._extract_sec_user_id(url)
++        self.assertEqual(
++            result,
++            "MS4wLjABAAAADCvhGc9nim1IjpbUh2fJShMcvh9wmHDpGIF0RmKMLzFybrvoatS5CmMVRdLOOcG7",
++        )
++
++    def test_extract_sec_user_id_fail(self) -> None:
++        """Malformed URL (missing /user/ segment) must return empty string."""
++        url = "https://www.douyin.com/notuser/MS4wL"
++        result = self.fetcher._extract_sec_user_id(url)
++        self.assertEqual(result, "")
++
++    def test_extract_sec_user_id_empty_url(self) -> None:
++        """Empty string URL must return empty string without raising."""
++        result = self.fetcher._extract_sec_user_id("")
++        self.assertEqual(result, "")
++
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++    # _parse_video_list 鈥?return type guardrails
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++
++    def test_parse_video_list_returns_video_records(self) -> None:
++        """_parse_video_list MUST return a list of VideoRecord (not dict)."""
++        payload = {
++            "aweme_list": [
++                {
++                    "aweme_id": "123456",
++                    "desc": "Test video 1",
++                    "video": {
++                        "bit_rate": [
++                            {"bit_rate": 1000, "play_addr": {"url_list": ["http://vid.low"]}},
++                            {"bit_rate": 2000, "play_addr": {"url_list": ["http://vid.high"]}},
++                        ],
++                        "cover": {"url_list": ["http://cover.jpg"]},
++                    },
++                }
++            ]
++        }
++        results = self.fetcher._parse_video_list(payload)
++        self.assertEqual(len(results), 1)
++        self.assertIsInstance(results[0], VideoRecord, "Must be a VideoRecord, not a dict")
++
++    def test_parse_video_list_highest_bitrate_selected(self) -> None:
++        """Parser selects the highest bitrate URL from the bit_rate array."""
++        payload = {
++            "aweme_list": [
++                {
++                    "aweme_id": "123456",
++                    "desc": "Test video 1",
++                    "video": {
++                        "bit_rate": [
++                            {"bit_rate": 1000, "play_addr": {"url_list": ["http://vid.low"]}},
++                            {"bit_rate": 2000, "play_addr": {"url_list": ["http://vid.high"]}},
++                        ],
++                        "cover": {"url_list": ["http://cover.jpg"]},
++                    },
++                }
++            ]
++        }
++        results = self.fetcher._parse_video_list(payload)
++        self.assertEqual(results[0].douyin_id, "123456")
++        self.assertEqual(results[0].title, "Test video 1")
++        self.assertEqual(results[0].video_url, "http://vid.high")
++        self.assertEqual(results[0].cover_url, "http://cover.jpg")
++
++    def test_parse_video_list_image_posts_filtered(self) -> None:
++        """Image posts (aweme_type=68 or images != None) must be silently discarded."""
++        payload = {
++            "aweme_list": [
++                {
++                    "aweme_id": "AAA",
++                    "aweme_type": 68,
++                    "desc": "Image post 鈥?must be filtered",
++                },
++                {
++                    "aweme_id": "BBB",
++                    "images": ["http://img1.jpg"],
++                    "desc": "Image-with-images-field 鈥?must be filtered",
++                    "video": {"bit_rate": [], "cover": {"url_list": []}},
++                },
++            ]
++        }
++        results = self.fetcher._parse_video_list(payload)
++        self.assertEqual(len(results), 0, "Image posts must be filtered out completely")
++
++    def test_parse_video_list_empty_aweme_list(self) -> None:
++        """Empty aweme_list must return an empty list without raising."""
++        payload = {"aweme_list": []}
++        results = self.fetcher._parse_video_list(payload)
++        self.assertEqual(results, [])
++
++    def test_parse_video_list_invalid_root(self) -> None:
++        """Non-dict root must return an empty list without raising."""
++        results = self.fetcher._parse_video_list([])  # type: ignore[arg-type]
++        self.assertEqual(results, [])
++
++    def test_parse_video_list_fallback_play_addr(self) -> None:
++        """If bit_rate is absent, falls back to direct play_addr URL list."""
++        payload = {
++            "aweme_list": [
++                {
++                    "aweme_id": "FALLBACK_001",
++                    "desc": "Fallback test",
++                    "video": {
++                        "play_addr": {"url_list": ["http://fallback.mp4"]},
++                        "cover": {"url_list": []},
++                    },
++                }
++            ]
++        }
++        results = self.fetcher._parse_video_list(payload)
++        self.assertEqual(len(results), 1)
++        self.assertEqual(results[0].video_url, "http://fallback.mp4")
++
++    def test_parse_video_list_title_truncated_to_300(self) -> None:
++        """Titles exceeding 300 characters must be truncated to prevent DB overflow."""
++        long_title = "A" * 400
++        payload = {
++            "aweme_list": [
++                {
++                    "aweme_id": "TRUNC_001",
++                    "desc": long_title,
++                    "video": {
++                        "play_addr": {"url_list": ["http://vid.mp4"]},
++                        "cover": {"url_list": []},
++                    },
++                }
++            ]
++        }
++        results = self.fetcher._parse_video_list(payload)
++        self.assertEqual(len(results[0].title), 300)
++
++    def test_parse_video_list_missing_video_key_skipped(self) -> None:
++        """Items with missing mandatory video keys must be skipped gracefully."""
++        payload = {
++            "aweme_list": [
++                {
++                    # aweme_id intentionally missing to trigger KeyError
++                    "desc": "bad item",
++                    "video": {"bit_rate": [], "cover": {"url_list": []}},
++                }
++            ]
++        }
++        # Must not raise; must return empty list
++        results = self.fetcher._parse_video_list(payload)
++        self.assertEqual(results, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_downloader.py b/tests/test_downloader.py
+new file mode 100644
+index 0000000..cf7d90b
+--- /dev/null
++++ b/tests/test_downloader.py
+@@ -0,0 +1,150 @@
++"""
++tests/test_downloader.py
++
++Unit tests for modules/downloader.py.
++Tests are synchronous using unittest with tmp directories to avoid
++filesystem side-effects. No network calls are made; requests.get
++is mocked.
++"""
++import unittest
++import shutil
++import tempfile
++from pathlib import Path
++from unittest.mock import patch, MagicMock
++
++import modules.downloader as dl_module
++from modules.downloader import Downloader
++
++
++class TestDownloader(unittest.TestCase):
++    def setUp(self) -> None:
++        # Use an isolated temp directory for each test run
++        self.test_dir = tempfile.mkdtemp()
++        # Override the module-level DOWNLOAD_DIR so no real filesystem is touched
++        dl_module.DOWNLOAD_DIR = Path(self.test_dir)
++        self.downloader = Downloader()
++
++    def tearDown(self) -> None:
++        shutil.rmtree(self.test_dir, ignore_errors=True)
++
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++    # Happy-path: streaming stays memory efficient
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++
++    def test_download_file_streams_chunks_not_all_at_once(self) -> None:
++        """
++        _download_file must use iter_content (chunked streaming), never load
++        the entire response body into memory in one shot.
++        """
++        chunk_data = [b"chunk1", b"chunk2", b""]  # sentinel empty bytes marks end
++
++        mock_response = MagicMock()
++        mock_response.__enter__ = lambda s: s
++        mock_response.__exit__ = MagicMock(return_value=False)
++        mock_response.raise_for_status = MagicMock()
++        mock_response.status_code = 200
++        mock_response.headers = {"content-length": "12"}
++        mock_response.iter_content = MagicMock(return_value=iter(chunk_data))
++
++        dest = Path(self.test_dir) / "test_video.mp4"
++
++        with patch("modules.downloader.requests.get", return_value=mock_response):
++            result = self.downloader._download_file("http://fake.url/vid.mp4", dest)
++
++        self.assertTrue(result)
++        # Confirm iter_content was called (streaming, not .content bulk-read)
++        mock_response.iter_content.assert_called_once()
++        # File should exist on disk
++        self.assertTrue(dest.exists())
++
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++    # Network failure returns False, no partial file
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++
++    def test_download_file_returns_false_on_network_error(self) -> None:
++        """_download_file must return False and leave no partial file on connection error."""
++        import requests
++
++        dest = Path(self.test_dir) / "corrupt_video.mp4"
++
++        with patch("modules.downloader.requests.get", side_effect=requests.ConnectionError("timeout")):
++            result = self.downloader._download_file("http://invalid.url/vid.mp4", dest)
++
++        self.assertFalse(result)
++
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++    # 403 Forbidden aborts immediately (no retries)
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++
++    def test_download_file_aborts_on_403(self) -> None:
++        """403 Forbidden from the CDN must cause immediate abort (CDN link expired)."""
++        import requests as req_lib
++
++        forbidden_resp = MagicMock()
++        forbidden_resp.status_code = 403
++        http_error = req_lib.exceptions.HTTPError(response=forbidden_resp)
++
++        mock_response = MagicMock()
++        mock_response.__enter__ = lambda s: s
++        mock_response.__exit__ = MagicMock(return_value=False)
++        mock_response.raise_for_status = MagicMock(side_effect=http_error)
++        mock_response.status_code = 403
++        mock_response.headers = {}
++
++        dest = Path(self.test_dir) / "forbidden_video.mp4"
++
++        with patch("modules.downloader.requests.get", return_value=mock_response):
++            result = self.downloader._download_file("http://cdn.expired/vid.mp4", dest)
++
++        self.assertFalse(result)
++
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++    # download_media: video failure returns None
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++
++    def test_download_media_returns_none_on_video_failure(self) -> None:
++        """
++        If the mp4 download fails, download_media must return None
++        and must clean up any partial file.
++        """
++        with patch.object(self.downloader, "_download_file", return_value=False):
++            result = self.downloader.download_media("999", "http://bad/vid.mp4", "")
++
++        self.assertIsNone(result)
++
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++    # download_media: success returns path dict
++    # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
++
++    def test_download_media_returns_path_dict_on_success(self) -> None:
++        """
++        download_media must return a dict with local_video_path and local_cover_path
++        when both downloads succeed (cover conversion is tested independently).
++        """
++        def fake_download(url: str, dest: Path, **kwargs) -> bool:
++            dest.parent.mkdir(parents=True, exist_ok=True)
++            dest.write_bytes(b"FAKE_CONTENT")
++            return True
++
++        with patch.object(self.downloader, "_download_file", side_effect=fake_download):
++            # Patch Pillow operations so we don't need actual image data
++            with patch("modules.downloader.Image") as mock_image:
++                mock_img = MagicMock()
++                mock_img.convert.return_value = mock_img
++                mock_image.open.return_value.__enter__ = lambda s: mock_img
++                mock_image.open.return_value.__exit__ = MagicMock(return_value=False)
++                mock_image.new.return_value = mock_img
++
++                result = self.downloader.download_media(
++                    "DY_OK_001",
++                    "http://fake/vid.mp4",
++                    "http://fake/cover.webp",
++                )
++
++        self.assertIsNotNone(result)
++        self.assertIn("local_video_path", result)
++        self.assertIn("local_cover_path", result)
++
++
++if __name__ == "__main__":
++    unittest.main()
