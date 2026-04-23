@@ -16,6 +16,42 @@ from modules.sweeper import DiskSweeper
 from modules.notifier import BarkNotifier
 from utils.models import VideoRecord, ProxyConfig
 
+
+def _normalize_schedule_mode(raw: object) -> str:
+    m = str(raw or "interval").lower().strip()
+    if m in ("clock", "cron", "fixed_times", "fixed", "time", "daily"):
+        return "clock"
+    return "interval"
+
+
+def parse_clock_times_from_config() -> list[tuple[int, int]]:
+    """Build local-time (hour, minute) slots from ``sync_clock_times`` or legacy ``cron_hour`` / ``cron_minute``."""
+    out: list[tuple[int, int]] = []
+    raw_times = config.get("sync_clock_times", None)
+    if isinstance(raw_times, list):
+        for t in raw_times:
+            if not isinstance(t, str) or ":" not in t:
+                continue
+            parts = t.strip().split(":", 1)
+            try:
+                h = int(parts[0].strip())
+                m = int(parts[1].strip())
+            except ValueError:
+                continue
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                out.append((h, m))
+    if out:
+        return out
+    try:
+        h = int(config.get("cron_hour", 2))
+        m = int(config.get("cron_minute", 0))
+    except (TypeError, ValueError):
+        return []
+    if 0 <= h <= 23 and 0 <= m <= 59:
+        return [(h, m)]
+    return []
+
+
 class PipelineCoordinator:
     def __init__(self):
         self.scheduler = BackgroundScheduler()
@@ -30,16 +66,6 @@ class PipelineCoordinator:
         # Mutex lock preventing concurrent pipeline runs
         self._pipeline_lock = threading.Lock()
 
-    def check_network(self) -> bool:
-        """Epic 4.2 Pre-flight network probe."""
-        try:
-            # We enforce direct domestic connection testing
-            requests.get("https://www.baidu.com", timeout=5)
-            return True
-        except Exception as e:
-            logger.warning("PipelineCoordinator: Pre-flight network probe isolated environment -> %s", e)
-            return False
-
     def recover_zombies(self):
         """Epic 4.4 Self-Healing."""
         logger.info("PipelineCoordinator: Executing Self-Healing Zombie Reverter sequence...")
@@ -47,25 +73,32 @@ class PipelineCoordinator:
         if reverted > 0:
             logger.warning("PipelineCoordinator: Successfully rescued %s stranded zombie tasks from previous unexpected halt.", reverted)
 
-    def primary_sync_job(self):
+    def primary_sync_job(self, force_retry_bypass: bool = False):
         """The master scheduled task bridging and governing all Epics."""
         if not self._pipeline_lock.acquire(blocking=False):
             logger.warning("PipelineCoordinator: Pipeline already running. Skipping duplicate invocation.")
             return
         
         try:
-            asyncio.run(self._run_async_cycle())
+            asyncio.run(self._run_async_cycle(force_retry_bypass))
         finally:
             self._pipeline_lock.release()
 
-    async def _run_async_cycle(self):
+    async def _run_async_cycle(self, force_retry_bypass: bool = False):
         """Internal sync cycle, executed asynchronously."""
         logger.info("PipelineCoordinator: === Initiating Scheduled Primary Sync Cycle ===")
+        if force_retry_bypass:
+            n = VideoDAO.prepare_for_force_manual_retry()
+            logger.info(
+                "PipelineCoordinator: Force manual retry — normalized %s DB row(s); this cycle ignores give_up caps.",
+                n,
+            )
         
         # Hot-reload configurations
         config.reload()
 
-        if not self.check_network():
+        from utils.network import preflight_network_check
+        if not await preflight_network_check():
             logger.warning("PipelineCoordinator: Offline state detected. Aborting this sync cycle safely.")
             return
             
@@ -80,12 +113,21 @@ class PipelineCoordinator:
              logger.warning("PipelineCoordinator: CIRCUIT BREAKER ACTIVE. YouTube APIs are suspended until the next 24h cycle resets.")
 
         # Story 1.5 - Setup YouTube parameters and proxy securely
-        yt_token = str(config.get("youtube_api_token", ""))
+        yt_token = str(config.get("youtube_api_token", "") or "").strip()
         yt_proxy = str(config.get("youtube_proxy", ""))
+        token_file = str(config.get("youtube_token_file", "youtube_token.json") or "youtube_token.json")
+        client_secret = str(
+            config.get("youtube_client_secret_file", "client_secret.json") or "client_secret.json"
+        )
         proxy_config = ProxyConfig(http=yt_proxy, https=yt_proxy) if yt_proxy else None
-        
-        # Isolated network client
-        uploader = YoutubeUploader(token=yt_token, proxy_config=proxy_config)
+
+        # Isolated network client (token may be filled from youtube_token.json inside YoutubeUploader)
+        uploader = YoutubeUploader(
+            client_secrets_file=client_secret,
+            token=yt_token or None,
+            proxy_config=proxy_config,
+            token_file=token_file,
+        )
 
         try:
             # Phase 1. Fetcher Subroutine
@@ -143,7 +185,9 @@ class PipelineCoordinator:
                 
                 # Phase 3-Pre: Re-upload videos
                 if not is_youtube_blocked:
-                    uploadable = VideoDAO.get_uploadable_videos(limit=slots_left)
+                    uploadable = VideoDAO.get_uploadable_videos(
+                        limit=slots_left, ignore_retry_cap=force_retry_bypass
+                    )
                     for video in uploadable:
                         if slots_left <= 0: break
                         dy_id = video.douyin_id
@@ -165,16 +209,34 @@ class PipelineCoordinator:
                                 VideoDAO.update_status(dy_id, 'uploaded')
                                 self.notifier.record_upload_success()  # AC2: daily counter
                                 slots_left -= 1
+                                logger.info(
+                                    "PipelineCoordinator: Re-upload succeeded for [%s] → YouTube video id %s",
+                                    dy_id,
+                                    yt_id,
+                                )
                             else:
                                 retry = video.retry_count + 1
-                                new_status = 'give_up' if retry >= 3 else 'failed'
+                                exhausted = retry >= 3 and not force_retry_bypass
+                                new_status = 'give_up' if exhausted else 'failed'
                                 VideoDAO.update_status(dy_id, new_status, {'retry_count': retry})
                                 if new_status == 'give_up':
+                                    logger.error(
+                                        "PipelineCoordinator: Re-upload give_up [%s] after empty YouTube id (retry=%s). No further auto upload.",
+                                        dy_id,
+                                        retry,
+                                    )
                                     await asyncio.to_thread(
                                         self.notifier.push,  # AC3: immediate critical alert
                                         "DouyinSync: Upload Give Up",
                                         "Video [%s] failed 3 times and was abandoned" % dy_id,
                                         level="timeSensitive"
+                                    )
+                                else:
+                                    logger.warning(
+                                        "PipelineCoordinator: Re-upload empty YouTube id [%s] → status=failed retry=%s/3. "
+                                        "Will retry upload on a later sync (get_uploadable_videos).",
+                                        dy_id,
+                                        retry,
                                     )
                         except Exception as e:
                             logger.error("Youtube upload error for [%s]: %s", dy_id, e)
@@ -189,7 +251,15 @@ class PipelineCoordinator:
                                     level="timeSensitive"
                                 )
                                 break
-                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': video.retry_count + 1})
+                            new_rc = video.retry_count + 1
+                            VideoDAO.update_status(dy_id, 'failed', {'retry_count': new_rc})
+                            logger.warning(
+                                "PipelineCoordinator: Re-upload exception [%s] → status=failed retry=%s/3. "
+                                "Will retry on a later sync if local file still exists. Error: %s",
+                                dy_id,
+                                new_rc,
+                                e,
+                            )
                 
                 # Phase 3-Main: Download + Upload new
                 if slots_left > 0:
@@ -215,11 +285,76 @@ class PipelineCoordinator:
                     try:
                         paths = await self.downloader.download_media(dy_id, video_url, cover_url)
                         if not paths:
-                            VideoDAO.update_status(dy_id, 'failed')
+                            retry = video.retry_count + 1
+                            if retry >= 3 and not force_retry_bypass:
+                                VideoDAO.update_status(
+                                    dy_id,
+                                    "give_up",
+                                    {"retry_count": retry, "local_video_path": None, "local_cover_path": None},
+                                )
+                                await asyncio.to_thread(
+                                    self.notifier.push,
+                                    "DouyinSync: Download Give Up",
+                                    "Video [%s] failed to download after 3 attempts." % dy_id,
+                                    level="timeSensitive",
+                                )
+                                logger.error(
+                                    "PipelineCoordinator: Download give_up [%s] after 3 failed attempts (empty result).",
+                                    dy_id,
+                                )
+                            else:
+                                VideoDAO.update_status(
+                                    dy_id,
+                                    "pending",
+                                    {
+                                        "retry_count": retry,
+                                        "local_video_path": None,
+                                        "local_cover_path": None,
+                                    },
+                                )
+                                logger.warning(
+                                    "PipelineCoordinator: Download failed for [%s]; queued retry %s%s.",
+                                    dy_id,
+                                    retry,
+                                    " (force bypass: stays pending)" if force_retry_bypass and retry >= 3 else "/3",
+                                )
                             continue
                     except Exception as e:
                         logger.error("PipelineCoordinator: Downloader Exception for [%s]: %s", dy_id, e)
-                        VideoDAO.update_status(dy_id, 'failed')
+                        retry = video.retry_count + 1
+                        if retry >= 3 and not force_retry_bypass:
+                            VideoDAO.update_status(
+                                dy_id,
+                                "give_up",
+                                {"retry_count": retry, "local_video_path": None, "local_cover_path": None},
+                            )
+                            await asyncio.to_thread(
+                                self.notifier.push,
+                                "DouyinSync: Download Give Up",
+                                "Video [%s] raised after 3 attempts: %s" % (dy_id, e),
+                                level="timeSensitive",
+                            )
+                            logger.error(
+                                "PipelineCoordinator: Download give_up [%s] after 3 exceptions: %s",
+                                dy_id,
+                                e,
+                            )
+                        else:
+                            VideoDAO.update_status(
+                                dy_id,
+                                "pending",
+                                {
+                                    "retry_count": retry,
+                                    "local_video_path": None,
+                                    "local_cover_path": None,
+                                },
+                            )
+                            logger.warning(
+                                "PipelineCoordinator: Download exception [%s]; queued retry %s → pending. Error: %s",
+                                dy_id,
+                                retry,
+                                e,
+                            )
                         continue
                     
                     video.local_video_path = paths['local_video_path']
@@ -227,8 +362,10 @@ class PipelineCoordinator:
                     
                     VideoDAO.update_status(dy_id, 'downloaded', {
                         'local_video_path': video.local_video_path,
-                        'local_cover_path': video.local_cover_path
+                        'local_cover_path': video.local_cover_path,
+                        'retry_count': 0,
                     })
+                    video.retry_count = 0
 
                     if is_youtube_blocked:
                          continue
@@ -242,9 +379,36 @@ class PipelineCoordinator:
                             VideoDAO.update_status(dy_id, 'uploaded')
                             self.notifier.record_upload_success()  # AC2: daily counter
                             slots_left -= 1
+                            logger.info(
+                                "PipelineCoordinator: First-pass upload succeeded for [%s] → YouTube video id %s",
+                                dy_id,
+                                yt_id,
+                            )
                             if slots_left <= 0: break
                         else:
-                            VideoDAO.update_status(dy_id, 'failed')
+                            retry = video.retry_count + 1
+                            exhausted = retry >= 3 and not force_retry_bypass
+                            new_status = 'give_up' if exhausted else 'failed'
+                            VideoDAO.update_status(dy_id, new_status, {'retry_count': retry})
+                            if new_status == 'give_up':
+                                logger.error(
+                                    "PipelineCoordinator: First-pass upload give_up [%s] — empty YouTube id after retry=%s.",
+                                    dy_id,
+                                    retry,
+                                )
+                                await asyncio.to_thread(
+                                    self.notifier.push,
+                                    "DouyinSync: Upload Give Up",
+                                    "Video [%s] returned empty YouTube id after 3 attempts." % dy_id,
+                                    level="timeSensitive",
+                                )
+                            else:
+                                logger.warning(
+                                    "PipelineCoordinator: First-pass upload empty YouTube id [%s] → status=failed retry=%s/3. "
+                                    "Later sync will re-attempt via Phase 3-Pre (get_uploadable_videos).",
+                                    dy_id,
+                                    retry,
+                                )
                     except Exception as e:
                         logger.error("Youtube upload exception: %s", e)
                         if type(e).__name__ == "YoutubeQuotaError":
@@ -258,7 +422,31 @@ class PipelineCoordinator:
                                 level="timeSensitive"
                             )
                             break
-                        VideoDAO.update_status(dy_id, 'failed')
+                        retry = video.retry_count + 1
+                        exhausted = retry >= 3 and not force_retry_bypass
+                        new_status = 'give_up' if exhausted else 'failed'
+                        VideoDAO.update_status(dy_id, new_status, {'retry_count': retry})
+                        if new_status == 'give_up':
+                            logger.error(
+                                "PipelineCoordinator: First-pass upload give_up [%s] after exception (retry=%s): %s",
+                                dy_id,
+                                retry,
+                                e,
+                            )
+                            await asyncio.to_thread(
+                                self.notifier.push,
+                                "DouyinSync: Upload Give Up",
+                                "Video [%s] failed after 3 upload attempts: %s" % (dy_id, e),
+                                level="timeSensitive",
+                            )
+                        else:
+                            logger.warning(
+                                "PipelineCoordinator: First-pass upload exception [%s] → status=failed retry=%s. "
+                                "Keeps local file; next sync retries via Phase 3-Pre. Error: %s",
+                                dy_id,
+                                retry,
+                                e,
+                            )
 
         except Exception as e:
             logger.error("PipelineCoordinator: Unhandled Exception in main sync loop engine: %s", e)
@@ -267,20 +455,74 @@ class PipelineCoordinator:
 
     def janitor_job(self):
         """Scheduled routine for Epic 5.3 deleting stale media traces."""
-        self.sweeper.purge_stale_media(max_age_days=7)
+        try:
+            max_age_days = int(float(config.get("storage_retention_days", 7)))
+            if max_age_days <= 0:
+                raise ValueError("max_age_days must be strictly positive")
+        except (ValueError, TypeError):
+            logger.warning("PipelineCoordinator: Invalid storage_retention_days config value, defaulting to 7 days.")
+            max_age_days = 7
+        self.sweeper.purge_stale_media(max_age_days=max_age_days)
+
+    def _add_primary_sync_jobs(self) -> None:
+        """Register primary pipeline job(s) from ``sync_schedule_mode`` (interval vs clock)."""
+        mode = _normalize_schedule_mode(config.get("sync_schedule_mode", "interval"))
+        if mode == "clock":
+            times = parse_clock_times_from_config()
+            if not times:
+                logger.warning(
+                    "PipelineCoordinator: sync_schedule_mode=clock but no valid times; "
+                    "falling back to interval."
+                )
+                mode = "interval"
+        if mode == "interval":
+            interval = config.get("sync_interval_minutes", 60)
+            try:
+                interval = max(1, int(interval))
+            except (TypeError, ValueError):
+                interval = 60
+            self.scheduler.add_job(
+                self.primary_sync_job,
+                IntervalTrigger(minutes=interval),
+                id="primary_sync",
+                max_instances=1,
+            )
+            logger.info(
+                "PipelineCoordinator: Primary sync schedule = interval every %s minute(s).",
+                interval,
+            )
+            return
+        for i, (h, m) in enumerate(times):
+            jid = "primary_sync_%s_%02d%02d" % (i, h, m)
+            self.scheduler.add_job(
+                self.primary_sync_job,
+                CronTrigger(hour=h, minute=m),
+                id=jid,
+                max_instances=1,
+            )
+        logger.info("PipelineCoordinator: Primary sync schedule = clock at local times %s.", times)
+
+    def apply_primary_schedule(self) -> None:
+        """Drop all ``primary_sync*`` jobs and re-add from current config (after ``config.reload()``)."""
+        try:
+            jobs = self.scheduler.get_jobs()
+        except Exception:
+            return
+        for job in jobs:
+            jid = getattr(job, "id", "") or ""
+            if jid.startswith("primary_sync"):
+                try:
+                    self.scheduler.remove_job(jid)
+                except Exception:
+                    pass
+        self._add_primary_sync_jobs()
 
     def start(self):
         """Mounts background logical dependencies cleanly."""
         self.recover_zombies()
-        
-        interval = config.get("sync_interval_minutes", 60)
-        self.scheduler.add_job(
-            self.primary_sync_job, 
-            IntervalTrigger(minutes=interval), 
-            id='primary_sync',
-            max_instances=1
-        )
-        
+
+        self._add_primary_sync_jobs()
+
         self.scheduler.add_job(self.janitor_job, IntervalTrigger(hours=24), id='janitor_sync')
         
         # Epic 3.2: Daily passive Bark summary (sent at 23:50)
@@ -290,7 +532,19 @@ class PipelineCoordinator:
         
         import datetime
         self.scheduler.add_job(self.primary_sync_job, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=5))
-        logger.info("PipelineCoordinator: Background APScheduler engaged natively. Rhythm: %s minutes.", interval)
+        mode = _normalize_schedule_mode(config.get("sync_schedule_mode", "interval"))
+        if mode == "interval":
+            interval = config.get("sync_interval_minutes", 60)
+            try:
+                interval = max(1, int(interval))
+            except (TypeError, ValueError):
+                interval = 60
+            logger.info("PipelineCoordinator: Background APScheduler engaged. Interval: %s min.", interval)
+        else:
+            logger.info(
+                "PipelineCoordinator: Background APScheduler engaged. Clock: %s.",
+                parse_clock_times_from_config(),
+            )
 
     def shutdown(self):
         logger.info("PipelineCoordinator: Received shutdown broadcast. Emptying queues gracefully...")

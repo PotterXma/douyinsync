@@ -63,11 +63,28 @@ class BarkNotifier:
             logger.warning("BarkNotifier: Failed bridging notification payload remotely -> %s", e)
 
     def _check_and_reset_daily_counter(self) -> None:
-        """Resets the daily upload counter if the calendar date has changed."""
+        """重置每日上传计数器（若日历日期已变更则归零）。"""
         today = datetime.date.today().isoformat()
         if today != self._summary_date:
             self._daily_upload_count = 0
             self._summary_date = today
+
+    def _snapshot_and_reset_daily_counter(self) -> int:
+        """
+        原子性地快照当前计数并在跨日时重置。
+        先读取再重置，避免午夜滚动竞态：
+          - 若调度器在 23:59 准备触发，但实际执行已过 00:00，
+            直接调用 _check_and_reset_daily_counter 会先归零再读取，
+            导致前一天数据丢失。本方法先快照后重置，保证数据不丢。
+        返回快照值（前一天或当天的计数）。
+        """
+        snapshot = self._daily_upload_count
+        today = datetime.date.today().isoformat()
+        if today != self._summary_date:
+            # 日期已翻滚：snapshot 持有前一天数据，现在安全重置
+            self._daily_upload_count = 0
+            self._summary_date = today
+        return snapshot
 
     def record_upload_success(self) -> None:
         """Increments the in-memory daily upload counter. Call once per successful upload."""
@@ -76,12 +93,12 @@ class BarkNotifier:
 
     def push_daily_summary(self) -> None:
         """
-        Sends a passive daily summary push with the current accumulated upload count.
-        Uses level='passive' (silent delivery) to avoid notification fatigue.
-        No-op if counter is zero.
+        发送当日上传汇总推送（passive 静默级别，防止通知疲劳）。
+        若计数为 0 则静默跳过。
+        使用 _snapshot_and_reset_daily_counter 避免午夜滚动竞态：
+        即使调度器延迟触发跨过午夜，也能正确发送前一天的统计数据。
         """
-        self._check_and_reset_daily_counter()
-        count = self._daily_upload_count
+        count = self._snapshot_and_reset_daily_counter()
         if count == 0:
             return
         self.push(

@@ -3,6 +3,7 @@ import sqlite3
 import time
 from pathlib import Path
 from contextlib import contextmanager
+from typing import Optional
 
 from modules.logger import logger
 from utils.models import VideoRecord
@@ -165,16 +166,20 @@ class VideoDAO:
         return results
 
     @staticmethod
-    def get_uploadable_videos(limit: int = 1) -> list[VideoRecord]:
+    def get_uploadable_videos(limit: int = 1, *, ignore_retry_cap: bool = False) -> list[VideoRecord]:
         """
         Retrieves videos that were downloaded but failed to upload (status='downloaded' or 'failed' with local paths).
-        Only returns videos with retry_count < 3 to prevent infinite retry loops.
+
+        Unless ``ignore_retry_cap`` is True, ``AND retry_count < 3`` applies to the **entire** WHERE clause, so both
+        ``downloaded`` and ``failed`` rows with high ``retry_count`` are excluded. When True, that filter is removed
+        (e.g. force manual retry cycle).
         """
-        sql = """
+        retry_filter = "" if ignore_retry_cap else "AND retry_count < 3"
+        sql = f"""
             SELECT *
             FROM videos 
             WHERE ((status = 'downloaded') OR (status = 'failed' AND local_video_path IS NOT NULL AND local_video_path != ''))
-              AND retry_count < 3
+              {retry_filter}
             ORDER BY updated_at ASC LIMIT ?
         """
         results = []
@@ -183,6 +188,70 @@ class VideoDAO:
             for row in cursor.execute(sql, (limit,)):
                 results.append(VideoDAO._row_to_record(row))
         return results
+
+    @staticmethod
+    def prepare_for_force_manual_retry() -> int:
+        """
+        Normalize exhausted or high-retry rows so a **force manual** pipeline pass can:
+        - re-download then upload when there is no usable local file, and
+        - re-upload when a local file is still present.
+
+        Returns the total number of rows updated (sum of statement rowcounts).
+
+        Runs inside a single ``BEGIN IMMEDIATE`` transaction so either all four UPDATEs apply or none.
+        """
+        now = int(time.time())
+        with db.get_connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                total = 0
+                cur = conn.execute(
+                    """
+                    UPDATE videos
+                    SET status = 'downloaded', retry_count = 0, updated_at = ?
+                    WHERE status IN ('give_up', 'give_up_fatal')
+                      AND local_video_path IS NOT NULL AND TRIM(local_video_path) != ''
+                    """,
+                    (now,),
+                )
+                total += cur.rowcount
+                cur = conn.execute(
+                    """
+                    UPDATE videos
+                    SET status = 'pending', retry_count = 0, updated_at = ?,
+                        local_video_path = NULL, local_cover_path = NULL
+                    WHERE status IN ('give_up', 'give_up_fatal')
+                      AND (local_video_path IS NULL OR TRIM(local_video_path) = '')
+                    """,
+                    (now,),
+                )
+                total += cur.rowcount
+                cur = conn.execute(
+                    """
+                    UPDATE videos
+                    SET status = 'downloaded', retry_count = 0, updated_at = ?
+                    WHERE status = 'failed'
+                      AND local_video_path IS NOT NULL AND TRIM(local_video_path) != ''
+                    """,
+                    (now,),
+                )
+                total += cur.rowcount
+                cur = conn.execute(
+                    """
+                    UPDATE videos
+                    SET status = 'pending', retry_count = 0, updated_at = ?,
+                        local_video_path = NULL, local_cover_path = NULL
+                    WHERE status = 'failed'
+                      AND (local_video_path IS NULL OR TRIM(local_video_path) = '')
+                    """,
+                    (now,),
+                )
+                total += cur.rowcount
+                conn.commit()
+                return total
+            except Exception:
+                conn.rollback()
+                raise
 
     @staticmethod
     def get_uploaded_today_count() -> int:
@@ -249,4 +318,90 @@ class VideoDAO:
             for row in cursor.execute(sql):
                 stats[row['status']] = row['count']
         return stats
+
+    @staticmethod
+    def get_accounts_pipeline_stats() -> dict[str, dict[str, int]]:
+        """
+        Per-account status counts for Epic 5 dashboard cards.
+        Keys are account_mark (empty/NULL -> 'Unknown'); inner keys are status -> count.
+        """
+        sql = """
+            SELECT account_mark, status, COUNT(*) AS cnt
+            FROM videos
+            GROUP BY account_mark, status
+        """
+        out: dict[str, dict[str, int]] = {}
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            for row in cursor.execute(sql):
+                mark = (row["account_mark"] or "").strip() or "Unknown"
+                st = row["status"]
+                out.setdefault(mark, {})[st] = row["cnt"]
+        return out
+
+    @staticmethod
+    def get_recent_failure_rows(limit: int = 25) -> list[dict[str, object]]:
+        """
+        Recent failed / give-up rows for dashboard failure panel (read-only UI).
+        """
+        sql = """
+            SELECT douyin_id, title, account_mark, status, retry_count, local_video_path, updated_at
+            FROM videos
+            WHERE status IN ('failed', 'give_up', 'give_up_fatal')
+            ORDER BY updated_at DESC
+            LIMIT ?
+        """
+        rows: list[dict[str, object]] = []
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            for row in cursor.execute(sql, (limit,)):
+                rows.append(
+                    {
+                        "douyin_id": row["douyin_id"],
+                        "title": (row["title"] or "")[:80],
+                        "account_mark": row["account_mark"] or "Unknown",
+                        "status": row["status"],
+                        "retry_count": row["retry_count"],
+                        "local_video_path": row["local_video_path"] or "",
+                        "updated_at": row["updated_at"],
+                    }
+                )
+        return rows
+
+    @staticmethod
+    def list_videos_for_library(filter_status: Optional[str] = None, limit: int = 500) -> list[tuple]:
+        """
+        Classic videolib Treeview rows:
+        (douyin_id, status, account_mark, retry_count, title, local_video_path).
+        ``filter_status`` is an exact DB status value, or None for all rows.
+        """
+        sql = (
+            "SELECT douyin_id, status, account_mark, retry_count, title, local_video_path "
+            "FROM videos"
+        )
+        params: list = []
+        if filter_status:
+            sql += " WHERE status = ?"
+            params.append(filter_status)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        with db.get_connection() as conn:
+            cur = conn.execute(sql, tuple(params))
+            return [tuple(row) for row in cur.fetchall()]
+
+    @staticmethod
+    def bulk_reset_to_pending(douyin_ids: list[str]) -> int:
+        """Sets status=pending and retry_count=0 for the given douyin_ids. Returns affected row count."""
+        if not douyin_ids:
+            return 0
+        now = int(time.time())
+        placeholders = ",".join("?" * len(douyin_ids))
+        sql = (
+            f"UPDATE videos SET status = 'pending', retry_count = 0, updated_at = ? "
+            f"WHERE douyin_id IN ({placeholders})"
+        )
+        params: tuple = (now, *douyin_ids)
+        with db.get_connection() as conn:
+            cur = conn.execute(sql, params)
+            return cur.rowcount
 

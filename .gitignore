@@ -12,13 +12,17 @@ venv/
 downloads/
 dist/
 logs/
-_bmad-output/
-_bmad/
 docs/project-scan-report.json
 
 # Secrets (CRITICAL)
 config.json
 client_secret.json
+
+# Local scratch / ad-hoc runner logs (repo root)
+out.log
+test_upload.log
+.manual_sync_request
+.manual_force_retry_request
 
 # OS generated files
 .DS_Store

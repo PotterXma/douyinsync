@@ -11,6 +11,7 @@ from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 
 from utils.models import VideoRecord, ProxyConfig, YoutubeQuotaError, YoutubeUploadError, YoutubeNetworkError
+from utils.network import async_client_kwargs_from_proxy_config
 from modules.logger import logger
 
 class YoutubeUploader:
@@ -20,7 +21,41 @@ class YoutubeUploader:
         self.client_secrets_file = Path(client_secrets_file)
         self.token_file = Path(token_file)
         self.proxy_config = proxy_config
-        self.token = token
+        if token is not None and str(token).strip():
+            self.token = str(token).strip()
+        else:
+            self.token = None
+        self._hydrate_token_from_storage()
+
+    def _hydrate_token_from_storage(self) -> None:
+        """If ``youtube_api_token`` was not passed in config, load (and optionally refresh) ``youtube_token.json``."""
+        if self.token:
+            return
+        if not self.token_file.is_file():
+            return
+        try:
+            creds = Credentials.from_authorized_user_file(str(self.token_file), self.SCOPES)
+        except Exception as e:
+            logger.warning("YoutubeUploader: cannot read token file %s: %s", self.token_file, e)
+            return
+        try:
+            if not creds.valid:
+                if creds.expired and creds.refresh_token:
+                    logger.info("YoutubeUploader: refreshing expired token from %s", self.token_file)
+                    creds.refresh(GoogleRequest())
+                    self.token_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(self.token_file, "w", encoding="utf-8") as f:
+                        f.write(creds.to_json())
+                else:
+                    logger.warning(
+                        "YoutubeUploader: %s exists but credentials are not valid; run OAuth flow (authenticate).",
+                        self.token_file,
+                    )
+                    return
+            self.token = creds.token
+            logger.info("YoutubeUploader: loaded access token from %s", self.token_file)
+        except Exception as e:
+            logger.warning("YoutubeUploader: token refresh failed: %s", e)
 
     def authenticate(self) -> bool:
         """Boots the OAuth 2.0 flow securely or retrieves via cached refresh tokens."""
@@ -57,16 +92,20 @@ class YoutubeUploader:
         self.token = creds.token
         return True
 
+    from utils.decorators import auto_retry
+    @auto_retry(max_retries=3, exceptions=(YoutubeNetworkError, YoutubeUploadError))
     async def upload(self, video: VideoRecord) -> str:
         if not os.path.exists(video.local_video_path):
             raise FileNotFoundError(f"Video file not found: {video.local_video_path}")
-            
-        proxies = {}
-        if self.proxy_config:
-            if self.proxy_config.http:
-                proxies["http://"] = self.proxy_config.http
-            if self.proxy_config.https:
-                proxies["https://"] = self.proxy_config.https
+
+        if not self.token or not str(self.token).strip():
+            raise YoutubeUploadError(
+                "Missing YouTube OAuth access token (would send illegal 'Bearer ' header). "
+                "Set youtube_api_token in config.json, or place a valid %s next to the application (run OAuth once)."
+                % (self.token_file,)
+            )
+
+        client_kw = async_client_kwargs_from_proxy_config(self.proxy_config)
 
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -74,7 +113,7 @@ class YoutubeUploader:
             "X-Upload-Content-Length": str(os.path.getsize(video.local_video_path))
         }
 
-        async with httpx.AsyncClient(proxies=proxies) as client:
+        async with httpx.AsyncClient(**client_kw) as client:
             try:
                 # 1. Initiate Resumable Upload
                 metadata = {

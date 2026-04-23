@@ -59,16 +59,22 @@ class TestDownloader:
         """_download_file must return False and leave no partial file on connection error."""
         import httpx
         dest = Path(self.test_dir) / "corrupt_video.mp4"
-        
-        mock_client = AsyncMock()
-        mock_client.stream.side_effect = httpx.RequestError("timeout")
-        mock_client_ctx = AsyncMock()
-        mock_client_ctx.__aenter__.return_value = mock_client
-        
+
+        mock_stream_ctx = MagicMock()
+        mock_stream_ctx.__aenter__ = AsyncMock(side_effect=httpx.RequestError("timeout"))
+        mock_stream_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+
+        mock_client_ctx = MagicMock()
+        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_ctx.__aexit__ = AsyncMock(return_value=None)
+
         with patch("modules.downloader.httpx.AsyncClient", return_value=mock_client_ctx):
-            with patch("modules.downloader.asyncio.sleep", new_callable=AsyncMock): # Speed up retry delays
+            with patch("modules.downloader.asyncio.sleep", new_callable=AsyncMock):
                 result = await self.downloader._download_file("http://fake/bad.mp4", dest)
-            
+
         assert result is False
         assert not dest.exists()
 
@@ -77,18 +83,30 @@ class TestDownloader:
         """403 Forbidden from the CDN must cause immediate abort (CDN link expired)."""
         import httpx
         dest = Path(self.test_dir) / "forbidden_video.mp4"
-        
+
         forbidden_req = httpx.Request("GET", "http://fake")
         forbidden_resp = httpx.Response(403, request=forbidden_req)
-        
-        mock_client = AsyncMock()
-        mock_client.stream.side_effect = httpx.HTTPStatusError("403", request=forbidden_req, response=forbidden_resp)
-        mock_client_ctx = AsyncMock()
-        mock_client_ctx.__aenter__.return_value = mock_client
-        
+
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("403", request=forbidden_req, response=forbidden_resp)
+        )
+
+        mock_stream_ctx = MagicMock()
+        mock_stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_stream_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+
+        mock_client_ctx = MagicMock()
+        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_ctx.__aexit__ = AsyncMock(return_value=None)
+
         with patch("modules.downloader.httpx.AsyncClient", return_value=mock_client_ctx):
             result = await self.downloader._download_file("http://fake/forbidden", dest)
-            
+
         assert result is False
 
     @pytest.mark.asyncio

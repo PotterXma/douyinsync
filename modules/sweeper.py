@@ -42,11 +42,20 @@ class DiskSweeper:
                 for file in files:
                     file_path = Path(root) / file
                     if file_path.suffix.lower() in target_exts:
-                        mtime = file_path.stat().st_mtime
+                        try:
+                            mtime = file_path.stat().st_mtime
+                        except OSError:
+                            continue
                         if mtime < cutoff_epoch:
-                            size = file_path.stat().st_size
-                            file_path.unlink(missing_ok=True)
-                            reclaimed_bytes += size
+                            try:
+                                size = file_path.stat().st_size
+                                file_path.unlink(missing_ok=True)
+                                reclaimed_bytes += size
+                            except (PermissionError, OSError) as unlink_err:
+                                logger.warning(
+                                    "DiskSweeper: Could not delete %s — file may be locked: %s",
+                                    file_path.name, unlink_err
+                                )
                             
             if reclaimed_bytes > 0:
                 logger.info("DiskSweeper: Janitor operation complete. Reprieved %.2f MB of SSD sector space.", reclaimed_bytes / (1024**2))
@@ -55,3 +64,4 @@ class DiskSweeper:
                 
         except Exception as e:
             logger.error("DiskSweeper: Unexpected recursive fault during janitor sequence: %s", e)
+

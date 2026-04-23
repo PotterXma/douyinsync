@@ -69,12 +69,36 @@ async def test_youtube_upload_success(mock_client, proxy_config, video_record, t
     youtube_id = await uploader.upload(video_record)
     
     assert youtube_id == "youtube_vid_id"
-    # Ensure proxies are correct
-    mock_client.assert_called_with(proxies={"http://": "http://127.0.0.1:1080", "https://": "http://127.0.0.1:1080"})
+    # httpx >= 0.28: proxy via mounts + AsyncHTTPTransport (no ``proxies=`` kwarg)
+    mock_client.assert_called_once()
+    call_kw = mock_client.call_args.kwargs
+    assert "mounts" in call_kw
+    mounts = call_kw["mounts"]
+    assert "http://" in mounts and "https://" in mounts
+    assert isinstance(mounts["http://"], httpx.AsyncHTTPTransport)
 
     # Ensure thumbnail was uploaded
     thumb_post_calls = [c for c in mock_instance.post.call_args_list if "thumbnails" in str(c[0][0])]
     assert len(thumb_post_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_blank_token_without_file(tmp_path, proxy_config):
+    video_file = tmp_path / "v.mp4"
+    video_file.write_bytes(b"x")
+    vr = VideoRecord(
+        douyin_id="1",
+        title="t",
+        description="d",
+        local_video_path=str(video_file),
+        local_cover_path="",
+    )
+    missing = tmp_path / "no_such_token.json"
+    uploader = YoutubeUploader(proxy_config=proxy_config, token=None, token_file=str(missing))
+    with pytest.raises(YoutubeUploadError) as exc:
+        await uploader.upload(vr)
+    assert "Missing YouTube OAuth" in str(exc.value)
+
 
 @pytest.mark.asyncio
 @patch("modules.youtube_uploader.httpx.AsyncClient")

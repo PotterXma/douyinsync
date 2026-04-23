@@ -13,5 +13,14 @@ DouyinSync provides a robust, zero-touch operational automation pipeline for mon
 | Client | Google Python API | V3 | Interacting with YouTube services |
 | Testing | Unittest | Core | E2E and module pipeline verification |
 
+## 交付状态（与代码对齐）
+
+| 范围 | 状态 |
+|------|------|
+| 管道 / 抓取 / 下载 / 上传 / 清理 / 通知 | 已实现；见 `docs/architecture.md` |
+| Epic 5 可视化 | **已交付**：`main.py dashboard`（CustomTkinter HUD）、`main.py videolib`（经典管理库） |
+
+> BMAD：规划产物位于 `_bmad-output/planning-artifacts/` 与 `_bmad-output/implementation-artifacts/`；配置见 `_bmad/bmm/config.yaml`。验收以该目录 + `docs/` + `pytest` 为准。
+
 ## Repository Structure
-This is a Monolith architecture. All modules live within `/modules/` and decouple into distinct responsibilities unified by `scheduler.py` via APScheduler loops. Local persistent data gets saved safely under `/dist/` and media caching inside `/downloads/`.
+This is a Monolith architecture. Core logic lives in `/modules/` and is driven by `scheduler.py` (APScheduler). GUI entry points live under `/ui/`. Local persistent data and media cache follow paths described in `README.md` / `docs/architecture.md` (e.g. project root DB file `douyinsync.db`, `downloads/`).

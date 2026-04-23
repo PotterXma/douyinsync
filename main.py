@@ -1,6 +1,8 @@
 import sys
+import subprocess
 import threading
 import queue
+from pathlib import Path
 
 # ── Logging MUST be configured before any other module import ──────────────
 from utils.logger import setup_logging
@@ -13,7 +15,45 @@ from modules.config_manager import config
 from ui.tray_icon import TrayApp
 from utils.models import AppEvent
 from modules.scheduler import PipelineCoordinator
+from utils.paths import manual_force_retry_request_path, manual_sync_request_path
 
+
+def _launch_dashboard_subprocess() -> None:
+    """Spawn CustomTkinter HUD (same contract as modules/tray_app.py)."""
+    if getattr(sys, "frozen", False):
+        exe_dir = str(Path(sys.executable).parent)
+        subprocess.Popen([sys.executable, "dashboard"], cwd=exe_dir, close_fds=False)
+    else:
+        project_root = Path(__file__).resolve().parent
+        subprocess.Popen(
+            [sys.executable, str(project_root / "main.py"), "dashboard"],
+            cwd=str(project_root),
+            close_fds=False,
+        )
+
+
+def _consume_manual_sync_request_file() -> bool:
+    """Dashboard subprocess touches ``.manual_sync_request``; daemon runs one cycle and deletes it."""
+    p = manual_sync_request_path()
+    if not p.is_file():
+        return False
+    try:
+        p.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _consume_manual_force_retry_request_file() -> bool:
+    """Dashboard ``.manual_force_retry_request`` — one cycle with retry-cap bypass and DB normalization."""
+    p = manual_force_retry_request_path()
+    if not p.is_file():
+        return False
+    try:
+        p.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
 
 
 def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator):
@@ -31,6 +71,12 @@ def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator
     
     # Infinite loop isolated from Windows UI lock.
     while True:
+        if _consume_manual_force_retry_request_file():
+            logger.info("Manual sync: force-retry request (normalize give_up/failed; bypass per-attempt caps).")
+            coordinator.primary_sync_job(force_retry_bypass=True)
+        elif _consume_manual_sync_request_file():
+            logger.info("Manual sync: request file from Dashboard (or external touch).")
+            coordinator.primary_sync_job()
         try:
             event = event_queue.get(timeout=1.0)
             if event.command == "EXIT":
@@ -38,8 +84,17 @@ def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator
                 break
             elif event.command == "RELOAD_CONFIG":
                 logger.info("Reloading config.")
+                if config.reload():
+                    coordinator.apply_primary_schedule()
+            elif event.command == "RUN_PIPELINE_NOW":
+                logger.info("Manual sync: tray command RUN_PIPELINE_NOW.")
+                coordinator.primary_sync_job()
             elif event.command == "OPEN_DASHBOARD":
                 logger.info("Open dashboard command received.")
+                try:
+                    _launch_dashboard_subprocess()
+                except Exception as e:
+                    logger.exception("Failed to spawn dashboard subprocess: %s", e)
         except queue.Empty:
             pass
             
@@ -83,7 +138,15 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
         if sys.argv[1] == "dashboard":
+            # Epic 5: CustomTkinter HUD in isolated subprocess (tray spawns this).
+            from ui.dashboard_app import DashboardApp
+
+            DashboardApp().run()
+            sys.exit(0)
+        elif sys.argv[1] == "videolib":
+            # Classic Tk tree + reset workflow (optional deep management).
             from modules import dashboard
+
             dashboard.run_dashboard()
             sys.exit(0)
         elif sys.argv[1] == "settings":

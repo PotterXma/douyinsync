@@ -1,0 +1,243 @@
+diff --git a/modules/config_manager.py b/modules/config_manager.py
+index 2ff5574..5280190 100644
+--- a/modules/config_manager.py
++++ b/modules/config_manager.py
+@@ -3,12 +3,21 @@ import json
+ import threading
+ from pathlib import Path
+ from modules.logger import logger
++from utils.models import AppConfig, TargetConfig, ProxyConfig
+ 
+ if getattr(sys, 'frozen', False):
+     PROJECT_ROOT = Path(sys.executable).parent
+ else:
+     PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ 
++class ConfigParseError(Exception):
++    """Raised when the config.json file is malformed or invalid."""
++    pass
++
++class ConfigNotFoundError(Exception):
++    """Raised when the config.json file cannot be found."""
++    pass
++
+ class ConfigManager:
+     _instance = None
+     
+@@ -16,53 +25,76 @@ class ConfigManager:
+         """Implementation of the Singleton pattern"""
+         if not cls._instance:
+             cls._instance = super(ConfigManager, cls).__new__(cls)
+-            cls._instance.config_file = PROJECT_ROOT / "config.json"
+-            cls._instance._cache = {}
++            cls._instance.config_file = str(PROJECT_ROOT / "config.json")
+             cls._instance._lock = threading.Lock()
+-            cls._instance.reload()
++            cls._instance._config = None
+         return cls._instance
+ 
+-    def reload(self) -> bool:
++    def __init__(self, config_path: str = None):
+         """
+-        Reloads the configuration from disk into memory.
+-        Returns True if successful, False if reading or parsing fails 
+-        (preserving the old cache to prevent pipeline crash).
++        Initialization allows overriding config path for testing.
+         """
+-        if not self.config_file.exists():
+-            logger.critical(f"Configuration file missing at {self.config_file}. Please create it.")
+-            raise FileNotFoundError(f"Configuration file missing at {self.config_file}")
+-
+-        try:
+-            with open(self.config_file, "r", encoding="utf-8") as f:
+-                new_data = json.load(f)
+-            with self._lock:
+-                self._cache = new_data
+-            logger.info("Configuration loaded/reloaded successfully.")
+-            return True
+-        except json.JSONDecodeError as e:
+-            logger.error(f"Failed to parse config.json. Retaining previous working configuration. Detail: {e}")
+-            return False
+-        except Exception as e:
+-            logger.error(f"Unexpected error loading config.json: {e}")
+-            return False
++        if config_path:
++            self.config_file = config_path
+ 
+-    def get(self, key: str, default=None):
+-        """Retrieves a configuration value with dictionary-like .get logic."""
+-        with self._lock:
+-            return self._cache.get(key, default)
+-
+-    def get_proxies(self) -> dict:
++    def load_config(self) -> AppConfig:
+         """
+-        Returns a requests-compatible proxies dict formatted based on configuration.
+-        Returns None if no proxy is configured.
++        Reads from config.json, maps to strongly typed AppConfig Dataclass.
++        Throws ConfigNotFoundError if file is missing.
++        Throws ConfigParseError if JSON is invalid or schema is malformed.
+         """
+-        proxy_val = str(self.get("proxy", "")).strip()
+-        if proxy_val:
+-            return {
+-                "http": proxy_val,
+-                "https": proxy_val
+-            }
+-        return None
++        with self._lock:
++            path_obj = Path(self.config_file)
++            if not path_obj.exists():
++                logger.critical(f"Configuration file missing at {self.config_file}")
++                raise ConfigNotFoundError(f"Configuration file not found at {self.config_file}")
++            
++            try:
++                with open(self.config_file, "r", encoding="utf-8") as f:
++                    data = json.load(f)
++            except json.JSONDecodeError as e:
++                logger.critical(f"JSON Parse error in config file: {e}")
++                raise ConfigParseError(f"Failed to parse JSON configuration: {e}")
++
++            if not isinstance(data, dict):
++                raise ConfigParseError("Configuration root must be a JSON object")
++
++            # Parse proxies
++            proxy_data = data.get("proxies", {})
++            if not isinstance(proxy_data, dict):
++                raise ConfigParseError("'proxies' field must be an object")
++            proxies = ProxyConfig(
++                http=proxy_data.get("http"),
++                https=proxy_data.get("https")
++            )
++
++            # Parse targets
++            target_data = data.get("targets", [])
++            if not isinstance(target_data, list):
++                raise ConfigParseError("'targets' field must be a list")
++                
++            targets = []
++            for index, t in enumerate(target_data):
++                if not isinstance(t, dict):
++                    raise ConfigParseError(f"Target at index {index} must be an object")
++                douyin_id = t.get("douyin_id")
++                if not douyin_id:
++                    raise ConfigParseError(f"Target at index {index} is missing 'douyin_id'")
++                targets.append(TargetConfig(
++                    douyin_id=str(douyin_id),
++                    name=t.get("name")
++                ))
++
++            self._config = AppConfig(targets=targets, proxies=proxies)
++            logger.info("Configuration loaded successfully via ConfigManager.")
++            return self._config
++
++    @property
++    def config(self) -> AppConfig:
++        """Returns the loaded AppConfig. Raises if not loaded yet."""
++        if not self._config:
++            return self.load_config()
++        return self._config
+ 
+-# Singleton exported instance
+-config = ConfigManager()
++# Singleton instance exported
++config_manager = ConfigManager()
+diff --git a/tests/test_config_manager.py b/tests/test_config_manager.py
+new file mode 100644
+index 0000000..f5dd028
+--- /dev/null
++++ b/tests/test_config_manager.py
+@@ -0,0 +1,70 @@
++import pytest
++import os
++import tempfile
++import json
++from modules.config_manager import ConfigManager, ConfigNotFoundError, ConfigParseError
++from utils.models import AppConfig, TargetConfig, ProxyConfig
++
++def test_config_not_found():
++    manager = ConfigManager("nonexistent_config.json")
++    with pytest.raises(ConfigNotFoundError):
++        manager.load_config()
++
++def test_invalid_json():
++    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
++        f.write("{invalid json")
++        config_path = f.name
++    
++    try:
++        manager = ConfigManager(config_path)
++        with pytest.raises(ConfigParseError):
++            manager.load_config()
++    finally:
++        os.unlink(config_path)
++
++def test_valid_config():
++    valid_data = {
++        "targets": [
++            {"douyin_id": "test_id_1", "name": "user 1"},
++            {"douyin_id": "test_id_2"}
++        ],
++        "proxies": {
++            "http": "http://user:pass@127.0.0.1:1080",
++            "https": "http://user:pass@127.0.0.1:1080"
++        }
++    }
++    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
++        json.dump(valid_data, f)
++        config_path = f.name
++        
++    try:
++        manager = ConfigManager(config_path)
++        config = manager.load_config()
++        assert isinstance(config, AppConfig)
++        assert len(config.targets) == 2
++        assert config.targets[0].douyin_id == "test_id_1"
++        assert config.targets[0].name == "user 1"
++        assert config.targets[1].douyin_id == "test_id_2"
++        assert config.targets[1].name is None
++        assert config.proxies.http == "http://user:pass@127.0.0.1:1080"
++        assert config.proxies.https == "http://user:pass@127.0.0.1:1080"
++    finally:
++        os.unlink(config_path)
++
++def test_missing_douyin_id():
++    invalid_data = {
++        "targets": [
++            {"name": "user 1"}
++        ]
++    }
++    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
++        json.dump(invalid_data, f)
++        config_path = f.name
++        
++    try:
++        manager = ConfigManager(config_path)
++        with pytest.raises(ConfigParseError) as exc:
++            manager.load_config()
++        assert "missing 'douyin_id'" in str(exc.value)
++    finally:
++        os.unlink(config_path)
+diff --git a/utils/models.py b/utils/models.py
+new file mode 100644
+index 0000000..8d07848
+--- /dev/null
++++ b/utils/models.py
+@@ -0,0 +1,17 @@
++from dataclasses import dataclass, field
++from typing import List, Optional
++
++@dataclass
++class TargetConfig:
++    douyin_id: str
++    name: Optional[str] = None
++
++@dataclass
++class ProxyConfig:
++    http: Optional[str] = None
++    https: Optional[str] = None
++
++@dataclass
++class AppConfig:
++    targets: List[TargetConfig] = field(default_factory=list)
++    proxies: ProxyConfig = field(default_factory=ProxyConfig)

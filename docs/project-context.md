@@ -37,7 +37,7 @@ DouyinSync is a background daemon that automatically scrapes Douyin videos, down
 - `modules/win_ocr.py`: Synchronous wrapper over Windows Native OCR for extracting text from cover images.
 
 ### Structural Boundaries
-- **UI and Worker Separation**: The tray menu (`ui/tray_app.py`) must never block the main loop. Inter-component commands run via detached background threads or threading locks.
+- **UI and Worker Separation**: The tray flow (`ui/tray_icon.py` + `modules/tray_app.py`) must never block the main loop. Inter-component commands run via detached background threads or threading locks.
 - **Resource Limits**: The app strictly streams large videos to disk (avoiding memory bloat >300MB). RAM footprint is kept minimal.
 - **Paths**: Must support frozen executables (PyInstaller). Use `sys.frozen` and `sys.executable` fallbacks instead of just `__file__`.
 

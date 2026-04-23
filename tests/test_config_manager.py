@@ -57,6 +57,23 @@ def test_valid_config() -> None:
     finally:
         os.unlink(config_path)
 
+def test_targets_omitted_loads_empty_list() -> None:
+    data = {"proxies": {}, "douyin_accounts": [{"url": "https://example", "mark": "x"}]}
+    f = tempfile.NamedTemporaryFile(mode="w", delete=False)
+    config_path = f.name
+    f.close()
+    try:
+        with open(config_path, "w", encoding="utf-8") as f2:
+            json.dump(data, f2)
+        manager = ConfigManager(config_path)
+        cfg = manager.load_config()
+        assert isinstance(cfg, AppConfig)
+        assert cfg.targets == []
+        assert manager.get("douyin_accounts", []) != []
+    finally:
+        os.unlink(config_path)
+
+
 def test_missing_douyin_id() -> None:
     invalid_data = {
         "targets": [
@@ -75,5 +92,29 @@ def test_missing_douyin_id() -> None:
         with pytest.raises(ConfigParseError) as exc:
             manager.load_config()
         assert "missing 'douyin_id'" in str(exc.value)
+    finally:
+        os.unlink(config_path)
+
+
+def test_get_reads_raw_json_keys() -> None:
+    valid_data = {
+        "targets": [{"douyin_id": "id_a", "name": "A"}],
+        "proxies": {},
+        "sync_interval_minutes": 42,
+        "sync_schedule_mode": "clock",
+        "sync_clock_times": ["08:00", "20:30"],
+    }
+    f = tempfile.NamedTemporaryFile(mode="w", delete=False)
+    config_path = f.name
+    f.close()
+    try:
+        with open(config_path, "w", encoding="utf-8") as f2:
+            json.dump(valid_data, f2)
+        manager = ConfigManager(config_path)
+        manager.load_config()
+        assert manager.get("sync_interval_minutes", 1) == 42
+        assert manager.get("sync_schedule_mode", "interval") == "clock"
+        assert manager.get("sync_clock_times", []) == ["08:00", "20:30"]
+        assert manager.get("missing_key", "dflt") == "dflt"
     finally:
         os.unlink(config_path)

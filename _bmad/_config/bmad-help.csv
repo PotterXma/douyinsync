@@ -1,0 +1,9 @@
+module,skill,display-name,menu-code,description,action,args,phase,after,before,required,output-location,outputs
+bmm,_meta,DouyinSync 文档索引,IDX,仓库内人类与代理可读的总索引,open,,anytime,,,false,./docs/index.md,*.md
+bmm,_meta,工程上下文,CTX,AI 代理强制遵守的实现约束,open,,anytime,,,false,./docs/project-context.md,project-context.md
+bmm,_meta,架构设计,ARC,系统组件与数据流,open,,anytime,,,false,./docs/architecture.md,architecture.md
+bmm,_meta,Epic 与 Story 总表,EP,全部 Epic 与用户故事及验收,open,,anytime,,,false,./_bmad-output/planning-artifacts/epics-and-stories.md,epics-and-stories.md
+bmm,_meta,产品简报,PB,问题陈述与价值主张,open,,anytime,,,false,./_bmad-output/planning-artifacts/product-brief.md,product-brief.md
+bmm,_meta,Epic 回顾,RT,全 Epic 回顾摘要,open,,anytime,,,false,./_bmad-output/planning-artifacts/RETROSPECTIVES.md,RETROSPECTIVES.md
+bmm,_meta,冲刺状态,SPT,sprint-status.yaml 开发状态图,open,,anytime,,,false,./_bmad-output/implementation-artifacts/sprint-status.yaml,sprint-status.yaml
+bmm,_meta,逐故事笔记,ST,implementation-artifacts/stories 下 15 个 story-key.md,open,,anytime,,,false,./_bmad-output/implementation-artifacts/stories/,*.md

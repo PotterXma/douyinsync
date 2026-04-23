@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DouyinSync Design Directions</title>
+    <style>
+        body { margin: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #E5E7EB; padding: 2rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 2rem; }
+        .card { background-color: #1E1E1E; padding: 1.5rem; border-radius: 8px; border: 1px solid #333; }
+        .title { font-size: 1.2rem; font-weight: 600; margin-bottom: 1rem; color: #fff; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+        
+        /* Direction 1: Vercel Cards */
+        .vercel-card { background: #2B2B2B; border-radius: 6px; padding: 1rem; margin-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .green { background: #2ECC71; box-shadow: 0 0 5px #2ECC71; }
+        .yellow { background: #F1C40F; }
+        .red { background: #E74C3C; }
+        .mono { font-family: Consolas, monospace; font-size: 0.85rem; color: #9CA3AF; }
+
+        /* Direction 2: Docker Simple List */
+        .docker-row { display: flex; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid #333; }
+        .docker-name { flex-grow: 1; font-weight: 500; }
+        .docker-btn { background: transparent; color: #9CA3AF; border: 1px solid #555; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+        .docker-btn:hover { background: #333; }
+
+        /* Direction 3: Mini HUD */
+        .hud-stats { display: flex; justify-content: space-around; padding: 1rem 0; }
+        .hud-stat { text-align: center; }
+        .hud-num { font-size: 2rem; font-weight: bold; }
+        .hud-num.t-green { color: #2ECC71; }
+        .hud-num.t-yellow { color: #F1C40F; }
+        .hud-num.t-red { color: #E74C3C; }
+        .hud-label { font-size: 0.75rem; color: #9CA3AF; text-transform: uppercase; letter-spacing: 1px; }
+
+    </style>
+</head>
+<body>
+    <h1 style="text-align: center; margin-bottom: 3rem;">DouyinSync UX Directions Explorer</h1>
+    
+    <div class="grid">
+        <!-- Direction 1 -->
+        <div class="card">
+            <div class="title">Direction 1: Vercel / CI-CD Style</div>
+            <p style="font-size: 0.9rem; color: #9CA3AF; margin-bottom: 1.5rem;">Focuses on individual account pipelines. Best for seeing detailed breakdown per creator.</p>
+            
+            <div class="vercel-card">
+                <div>
+                    <div style="font-weight: 600;">@LiZiqi_Official</div>
+                    <div class="mono">Last sync: 2 mins ago</div>
+                </div>
+                <div><span class="status-dot green"></span> <span class="mono">15 / 15</span></div>
+            </div>
+            <div class="vercel-card" style="border: 1px solid #E74C3C33;">
+                <div>
+                    <div style="font-weight: 600;">@TechReviewer</div>
+                    <div class="mono" style="color: #E74C3C;">Cookie Expired</div>
+                </div>
+                <div><span class="status-dot red"></span> <span class="mono">0 / 3</span></div>
+            </div>
+            <div class="vercel-card">
+                <div>
+                    <div style="font-weight: 600;">@FunnyPets</div>
+                    <div class="mono">Uploading to YouTube...</div>
+                </div>
+                <div><span class="status-dot yellow"></span> <span class="mono">8 / 12</span></div>
+            </div>
+        </div>
+
+        <!-- Direction 2 -->
+        <div class="card">
+            <div class="title">Direction 2: Docker Desktop Style</div>
+            <p style="font-size: 0.9rem; color: #9CA3AF; margin-bottom: 1.5rem;">Extreme minimalism. Just rows, status squares, and quick restart actions.</p>
+            
+            <div class="docker-row">
+                <span class="status-dot green" style="border-radius: 2px;"></span>
+                <span class="docker-name">LiZiqi_Official</span>
+                <button class="docker-btn">Logs</button>
+            </div>
+            <div class="docker-row">
+                <span class="status-dot red" style="border-radius: 2px;"></span>
+                <span class="docker-name">TechReviewer</span>
+                <button class="docker-btn" style="border-color: #E74C3C; color: #E74C3C;">Fix Auth</button>
+            </div>
+            <div class="docker-row">
+                <span class="status-dot yellow" style="border-radius: 2px;"></span>
+                <span class="docker-name">FunnyPets</span>
+                <button class="docker-btn">Pause</button>
+            </div>
+        </div>
+
+        <!-- Direction 3 -->
+        <div class="card">
+            <div class="title">Direction 3: Mini Global HUD</div>
+            <p style="font-size: 0.9rem; color: #9CA3AF; margin-bottom: 1.5rem;">Completely abstracts individual accounts. Only shows global pipeline health metrics.</p>
+            
+            <div style="text-align: center; font-size: 0.85rem; color: #9CA3AF;">TODAY's GLOBAL PIPELINE</div>
+            <div class="hud-stats">
+                <div class="hud-stat">
+                    <div class="hud-num t-yellow">12</div>
+                    <div class="hud-label">Pending</div>
+                </div>
+                <div class="hud-stat">
+                    <div class="hud-num t-green">148</div>
+                    <div class="hud-label">Uploaded</div>
+                </div>
+                <div class="hud-stat">
+                    <div class="hud-num t-red">1</div>
+                    <div class="hud-label">Failed</div>
+                </div>
+            </div>
+            
+            <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #333;">
+                <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
+                    <span>YouTube Quota</span>
+                    <span class="mono t-green">45%</span>
+                </div>
+                <div style="width: 100%; background: #333; height: 4px; margin-top: 4px; border-radius: 2px;">
+                    <div style="width: 45%; background: #2ECC71; height: 100%; border-radius: 2px;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

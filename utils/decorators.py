@@ -7,6 +7,7 @@ These are sync-compatible and wrap both sync and async callable patterns.
 import time
 import asyncio
 import functools
+import inspect
 import logging
 import datetime
 from typing import Callable, Tuple, Type
@@ -34,7 +35,7 @@ def auto_retry(
     """
     def decorator(func: Callable) -> Callable:
         actual_retries = max(1, max_retries)
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
                 last_exc = None
@@ -101,7 +102,7 @@ def circuit_breaker(
     Forcefully suspends execution until the next chronological reset period.
     """
     def decorator(func: Callable) -> Callable:
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
                 try:

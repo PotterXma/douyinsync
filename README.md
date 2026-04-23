@@ -112,6 +112,8 @@ pip install -r requirements.txt
 }
 ```
 
+- **`youtube_client_secret_file`**：GCP 控制台下载的 OAuth 客户端 JSON 路径（默认 `client_secret.json`）。与 **`youtube_token_file`**（默认 `youtube_token.json`）、**`youtube_api_token`** 一起，由 `modules/scheduler.py` 传给上传器：日常上传用令牌文件或配置里的 token；**首次浏览器授权**或缺少密钥文件时，会读取该 JSON。
+
 ### 3. 一键启动
 在拥有完整运行环境的命令行下执行：
 ```bash
@@ -121,7 +123,34 @@ python main.py
 > 系统探测到你的 YouTube Token 为空时，会自动**强制弹出一个浏览器窗口**，要求你登录目标 YouTube 账号并授权挂载点。授权点一次即可，系统会自动将加密凭证生成到 `dist/youtube_token.json` 内长期使用（即便掉线也会尝试静默刷新）。
 
 启动成功后，您的桌面右下角系统托盘内会出现一个带有 "D" 字母的小图标。
-在图标上点击 **右键** 即可操作 `Open Dashboard (可视化大盘)` 或者安全关停软件。
+在图标上点击 **右键** 即可操作 **「🎥 视频状态管理库」**（默认打开 CustomTkinter 实时大盘），或安全关停软件。
+
+- **`python main.py dashboard`**：Epic 5 HUD（全局统计、YouTube 配额条、分账号卡片、最近失败只读列表）；盘内按钮可再打开经典 **视频库** 窗口。
+- **`python main.py videolib`**：经典 Tk 表格（筛选状态、批量重置 Pending），与 HUD 独立进程，互不阻塞托盘主进程。
+
+### 下载失败 / 上传失败时，系统怎么处理？
+
+处理逻辑在 **`modules/scheduler.py`**（定时同步与手动同步共用）。日志里请搜前缀 **`PipelineCoordinator:`**，可看到具体动作（例如 `→ status=failed retry=…`、`give_up`、`queued retry …/3 → pending`）。
+
+Dashboard **「手动重新执行（忽略重试上限）」** 会写入 **`.manual_force_retry_request`**：主进程本轮会先执行 **`prepare_for_force_manual_retry`**（把已放弃/高重试的失败条恢复为 `pending` 或 `downloaded`），并在该轮内**不按 3 次封顶**写入 `give_up`（仍受每日上传配额、磁盘预检、YouTube 熔断等约束）。
+
+| 情况 | 系统行为（摘要） |
+|------|------------------|
+| **下载失败**（CDN/网络等） | 前 2 次：改回 **`pending`** 并增加 `retry_count`，下周期重新拉流再下；第 3 次仍失败：**`give_up`**，并发 Bark（若已配置）。 |
+| **下载成功、上传失败**（含空 Token、网络错误等非配额类） | 记 **`failed`** 且**保留本地 MP4**，`retry_count` 递增；后续周期走 **Phase 3-Pre**（`get_uploadable_videos`）自动重传，最多 3 次后 **`give_up`**。 |
+| **YouTube 配额用尽** | 记录保持 **`downloaded`**，打开 24h 断路器，不计入「上传 3 次」重试。 |
+
+更细的表与 BMAD 故事见：**[docs/architecture.md](docs/architecture.md)**（§4.3）与 **`_bmad-output/implementation-artifacts/stories/3-4-download-and-upload-failure-handling.md`**。
+
+若日志曾出现 **`Illegal header value b'Bearer '`**，表示曾向 Google 发送了**空的 Bearer**。当前版本会在 **`youtube_api_token` 留空**时，自动尝试从运行目录下的 **`youtube_token.json`** 读取并刷新令牌（也可用 `config.json` 的 **`youtube_token_file`** 指定路径）。若仍失败：请完成一次 OAuth（见上文「首次运行重点提示」），或把有效访问令牌写入 **`youtube_api_token`**。
+
+---
+
+## 📋 BMAD 规划与冲刺状态
+
+- 配置：`_bmad/bmm/config.yaml`
+- 规划产出：`_bmad-output/planning-artifacts/`（PRD 快照、Epic/Story、追溯矩阵）
+- 冲刺状态：`_bmad-output/implementation-artifacts/sprint-status.yaml`
 
 ---
 

@@ -31,6 +31,7 @@ class ConfigManager:
                     cls._instance.config_file = str(PROJECT_ROOT / "config.json")
                     cls._instance._lock = threading.Lock()
                     cls._instance._config = None
+                    cls._instance._raw: dict = {}
         return cls._instance
 
     def __init__(self, config_path: str | None = None) -> None:
@@ -46,6 +47,7 @@ class ConfigManager:
         Reads from config.json, maps to strongly typed AppConfig Dataclass.
         Throws ConfigNotFoundError if file is missing.
         Throws ConfigParseError if JSON is invalid or schema is malformed.
+        Note: ``targets`` may be omitted (treated as an empty list).
         """
         with self._lock:
             if self._config is not None:
@@ -69,42 +71,50 @@ class ConfigManager:
             if not isinstance(data, dict):
                 raise ConfigParseError("Configuration root must be a JSON object")
 
-            # Parse proxies
-            proxy_data = data.get("proxies", {})
-            if not isinstance(proxy_data, dict):
-                raise ConfigParseError("'proxies' field must be an object")
-                
-            http_val = proxy_data.get("http")
-            https_val = proxy_data.get("https")
-            proxies = ProxyConfig(
-                http=str(http_val) if http_val is not None else None,
-                https=str(https_val) if https_val is not None else None
-            )
+            return self._parse_and_store_locked(data)
 
-            # Parse targets
-            target_data = data.get("targets")
-            if target_data is None:
-                raise ConfigParseError("Configuration missing mandatory 'targets' array")
-            if not isinstance(target_data, list):
-                raise ConfigParseError("'targets' field must be a list")
-                
-            targets = []
-            for index, t in enumerate(target_data):
-                if not isinstance(t, dict):
-                    raise ConfigParseError(f"Target at index {index} must be an object")
-                douyin_id = t.get("douyin_id")
-                if not douyin_id:
-                    raise ConfigParseError(f"Target at index {index} is missing 'douyin_id'")
-                
-                name_val = t.get("name")
-                targets.append(TargetConfig(
-                    douyin_id=str(douyin_id),
-                    name=str(name_val) if name_val is not None else None
-                ))
+    def _parse_and_store_locked(self, data: dict) -> AppConfig:
+        """Validate JSON root and persist typed AppConfig plus raw key-value mirror. Caller must hold ``_lock``."""
+        if not isinstance(data, dict):
+            raise ConfigParseError("Configuration root must be a JSON object")
 
-            self._config = AppConfig(targets=targets, proxies=proxies)
-            logger.info("Configuration loaded successfully via ConfigManager.")
-            return self._config
+        # Parse proxies
+        proxy_data = data.get("proxies", {})
+        if not isinstance(proxy_data, dict):
+            raise ConfigParseError("'proxies' field must be an object")
+
+        http_val = proxy_data.get("http")
+        https_val = proxy_data.get("https")
+        proxies = ProxyConfig(
+            http=str(http_val) if http_val is not None else None,
+            https=str(https_val) if https_val is not None else None
+        )
+
+        # Parse targets (optional legacy schema; sync pipeline uses ``douyin_accounts`` in raw JSON)
+        target_data = data.get("targets")
+        if target_data is None:
+            target_data = []
+        if not isinstance(target_data, list):
+            raise ConfigParseError("'targets' field must be a list")
+
+        targets = []
+        for index, t in enumerate(target_data):
+            if not isinstance(t, dict):
+                raise ConfigParseError(f"Target at index {index} must be an object")
+            douyin_id = t.get("douyin_id")
+            if not douyin_id:
+                raise ConfigParseError(f"Target at index {index} is missing 'douyin_id'")
+
+            name_val = t.get("name")
+            targets.append(TargetConfig(
+                douyin_id=str(douyin_id),
+                name=str(name_val) if name_val is not None else None
+            ))
+
+        self._raw = dict(data)
+        self._config = AppConfig(targets=targets, proxies=proxies)
+        logger.info("Configuration loaded successfully via ConfigManager.")
+        return self._config
 
     @property
     def config(self) -> AppConfig:
@@ -113,11 +123,40 @@ class ConfigManager:
             return self.load_config()
         return self._config
 
+    def reload(self) -> bool:
+        """Re-read ``config.json`` and replace in-memory typed + raw config. Returns False on I/O or parse errors."""
+        path_obj = Path(self.config_file)
+        if not path_obj.is_file():
+            logger.error("Configuration reload skipped: file missing at %s", self.config_file)
+            return False
+        try:
+            with open(path_obj, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except OSError as e:
+            logger.error("Configuration reload failed (read): %s", e)
+            return False
+        except json.JSONDecodeError as e:
+            logger.error("Configuration reload failed (JSON): %s", e)
+            return False
+        try:
+            with self._lock:
+                self._parse_and_store_locked(data)
+            logger.info("Configuration reloaded from disk.")
+            return True
+        except ConfigParseError as e:
+            logger.error("Configuration reload rejected (schema): %s", e)
+            return False
+
     def get(self, key: str, default=None):
-        """Legacy dictionary default access helper. Avoid using in new code."""
+        """Read arbitrary keys from ``config.json`` (mirrored in ``_raw``). ``proxies`` returns requests-style dict."""
         if key == "proxies":
             return self.get_proxies()
-        return default
+        self.load_config()
+        with self._lock:
+            raw = self._raw if isinstance(getattr(self, "_raw", None), dict) else {}
+            if key not in raw:
+                return default
+            return raw[key]
 
     def get_proxies(self) -> dict | None:
         """Returns a requests-compatible proxies dict formatted based on configuration."""

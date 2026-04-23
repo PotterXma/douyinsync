@@ -1,0 +1,28 @@
+# BMAD BMM — DouyinSync 项目配置（补齐版）
+# 供 bmad-agent-pm / bmad-help 等技能解析路径变量。
+
+project_name: DouyinSync
+project_key: douyinsync
+user_name: Maintainer
+
+communication_language: zh-CN
+document_output_language: zh-CN
+
+# 规划类产出（Epic/Story/PRD 快照、追溯矩阵）
+planning_artifacts: ./_bmad-output/planning-artifacts
+
+# 实现类产出（冲刺状态、装配说明、故事实现笔记）
+implementation_artifacts: ./_bmad-output/implementation-artifacts
+
+# 工程内权威上下文（相对仓库根）
+project_knowledge: ./docs/project-context.md
+
+prd_snapshot: ./_bmad-output/planning-artifacts/PRD-snapshot.md
+product_brief: ./_bmad-output/planning-artifacts/product-brief.md
+epics_document: ./_bmad-output/planning-artifacts/epics-and-stories.md
+traceability_matrix: ./_bmad-output/planning-artifacts/traceability-matrix.md
+retrospectives: ./_bmad-output/planning-artifacts/RETROSPECTIVES.md
+# 与 sprint-status.yaml 的 story_location 一致：逐故事 `.md` 落盘目录
+story_notes: ./_bmad-output/implementation-artifacts/stories
+
+tracking_system: file-system

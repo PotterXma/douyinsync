@@ -25,6 +25,10 @@ class TrayApp:
         self.event_queue.put(AppEvent(command="RELOAD_CONFIG"))
         icon.notify("Config Reloaded", title="DouyinSync")
 
+    def on_run_pipeline_now(self, icon, item):
+        self.event_queue.put(AppEvent(command="RUN_PIPELINE_NOW"))
+        icon.notify("Starting sync run…", title="DouyinSync")
+
     def on_open_dashboard(self, icon, item):
         self.event_queue.put(AppEvent(command="OPEN_DASHBOARD"))
         icon.notify("Dashboard Opening", title="DouyinSync")
@@ -35,6 +39,7 @@ class TrayApp:
 
     def setup(self):
         menu = Menu(
+            item('Run sync now', self.on_run_pipeline_now),
             item('Open Dashboard', self.on_open_dashboard, default=True),
             item('Reload Config', self.on_reload),
             item('Exit', self.on_exit)
