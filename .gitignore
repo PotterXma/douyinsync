@@ -30,6 +30,9 @@ test_upload.log
 .manual_force_retry_request
 .hud_scheduler_state.json
 
+# IDE / local agent (Cursor rules & skills stay machine-local)
+.cursor/
+
 # OS generated files
 .DS_Store
 Thumbs.db
