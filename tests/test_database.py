@@ -32,6 +32,10 @@ class TestDatabase(unittest.TestCase):
             columns = {row['name']: row['type'] for row in cursor.fetchall()}
             self.assertEqual(columns.get('created_at', '').upper(), 'INTEGER')
             self.assertEqual(columns.get('updated_at', '').upper(), 'INTEGER')
+            self.assertIn('upload_bytes_done', columns)
+            self.assertIn('upload_bytes_total', columns)
+            self.assertIn('last_error_summary', columns)
+            self.assertIn('youtube_video_id', columns)
         
     def test_insert_video_if_unique(self):
         test_video = VideoRecord(
@@ -116,6 +120,45 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(by_acct["ChanB"]["failed"], 1)
         self.assertEqual(by_acct["Unknown"]["pending"], 1)
 
+    def test_update_upload_progress_and_active_pipeline_video(self):
+        VideoDAO.insert_video_if_unique(
+            VideoRecord(douyin_id="UP_1", account_mark="Acc", title="Big", status="uploading")
+        )
+        VideoDAO.update_upload_progress("UP_1", 100, 1000)
+        with db_module.db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT upload_bytes_done, upload_bytes_total FROM videos WHERE douyin_id='UP_1'"
+            ).fetchone()
+            self.assertEqual(row["upload_bytes_done"], 100)
+            self.assertEqual(row["upload_bytes_total"], 1000)
+
+        active = VideoDAO.get_active_pipeline_video()
+        self.assertIsNotNone(active)
+        self.assertEqual(active["douyin_id"], "UP_1")
+        self.assertEqual(active["status"], "uploading")
+        self.assertEqual(active["upload_bytes_done"], 100)
+
+        VideoDAO.insert_video_if_unique(
+            VideoRecord(douyin_id="UP_2", account_mark="Acc", title="Dl", status="downloading")
+        )
+        VideoDAO.update_status("UP_1", "downloaded")
+        active2 = VideoDAO.get_active_pipeline_video()
+        self.assertIsNotNone(active2)
+        self.assertEqual(active2["douyin_id"], "UP_2")
+
+    def test_get_latest_uploaded_snapshot(self):
+        VideoDAO.insert_video_if_unique(
+            VideoRecord(douyin_id="YT_1", title="Done", status="uploaded")
+        )
+        VideoDAO.update_status(
+            "YT_1",
+            "uploaded",
+            {"youtube_video_id": "abc123XYZ"},
+        )
+        snap = VideoDAO.get_latest_uploaded_snapshot()
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["youtube_video_id"], "abc123XYZ")
+
     def test_get_recent_failure_rows(self):
         now = int(time.time())
         with db_module.db.get_connection() as conn:
@@ -150,24 +193,57 @@ class TestDatabase(unittest.TestCase):
         VideoDAO.insert_video_if_unique(
             VideoRecord(douyin_id="LIB_ROW_1", account_mark="Acc", title="Hello", status="pending")
         )
+        VideoDAO.insert_video_if_unique(
+            VideoRecord(douyin_id="LIB_ROW_UP", account_mark="Acc", title="Up", status="uploading")
+        )
+        VideoDAO.update_upload_progress("LIB_ROW_UP", 25, 100)
         rows_all = VideoDAO.list_videos_for_library(filter_status=None, limit=50)
         self.assertTrue(any(r[0] == "LIB_ROW_1" for r in rows_all))
+        row1 = next(r for r in rows_all if r[0] == "LIB_ROW_1")
+        self.assertEqual(len(row1), 11)
+        row_up = next(r for r in rows_all if r[0] == "LIB_ROW_UP")
+        self.assertEqual(row_up[7], 25)
+        self.assertEqual(row_up[8], 100)
         rows_f = VideoDAO.list_videos_for_library(filter_status="pending", limit=50)
         self.assertTrue(all(r[1] == "pending" for r in rows_f))
+
+    def test_count_uploaded_for_account(self):
+        VideoDAO.insert_video_if_unique(
+            VideoRecord(douyin_id="CNT_U1", account_mark="MarkOnly", title="t", status="uploaded")
+        )
+        VideoDAO.insert_video_if_unique(
+            VideoRecord(douyin_id="CNT_U2", account_mark="MarkOnly", title="t2", status="pending")
+        )
+        VideoDAO.insert_video_if_unique(
+            VideoRecord(douyin_id="CNT_U3", account_mark="Other", title="t3", status="uploaded")
+        )
+        self.assertEqual(VideoDAO.count_uploaded_for_account("MarkOnly"), 1)
+        self.assertEqual(VideoDAO.count_uploaded_for_account("Other"), 1)
 
     def test_bulk_reset_to_pending(self):
         VideoDAO.insert_video_if_unique(
             VideoRecord(douyin_id="LIB_RST_1", account_mark="Acc", title="X", status="failed", retry_count=2)
         )
+        with db_module.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE videos SET last_error_summary = ?, upload_bytes_done = 5, "
+                "upload_bytes_total = 10, youtube_video_id = ? WHERE douyin_id = ?",
+                ("err summary", "yt_old_id", "LIB_RST_1"),
+            )
         n = VideoDAO.bulk_reset_to_pending(["LIB_RST_1"])
         self.assertGreaterEqual(n, 1)
         with db_module.db.get_connection() as conn:
             row = conn.execute(
-                "SELECT status, retry_count FROM videos WHERE douyin_id = ?",
+                "SELECT status, retry_count, last_error_summary, upload_bytes_done, "
+                "upload_bytes_total, youtube_video_id FROM videos WHERE douyin_id = ?",
                 ("LIB_RST_1",),
             ).fetchone()
             self.assertEqual(row["status"], "pending")
             self.assertEqual(row["retry_count"], 0)
+            self.assertIsNone(row["last_error_summary"])
+            self.assertEqual(row["upload_bytes_done"], 0)
+            self.assertIsNone(row["upload_bytes_total"])
+            self.assertIsNone(row["youtube_video_id"])
 
     def test_revert_zombies(self):
         # Insert a set of states to test
@@ -180,6 +256,8 @@ class TestDatabase(unittest.TestCase):
         ]
         for record in test_data:
             VideoDAO.insert_video_if_unique(record)
+
+        VideoDAO.update_upload_progress("ZOMBIE_03", 500, 1000)
 
         # Act
         reverted_count = VideoDAO.revert_zombies()
@@ -203,6 +281,11 @@ class TestDatabase(unittest.TestCase):
             z3 = cursor.execute("SELECT status, retry_count FROM videos WHERE douyin_id='ZOMBIE_03'").fetchone()
             self.assertEqual(z3['status'], 'downloaded')
             self.assertEqual(z3['retry_count'], 1)
+            z3p = cursor.execute(
+                "SELECT upload_bytes_done, upload_bytes_total FROM videos WHERE douyin_id='ZOMBIE_03'"
+            ).fetchone()
+            self.assertEqual(z3p["upload_bytes_done"], 0)
+            self.assertIsNone(z3p["upload_bytes_total"])
             
             # pending with retry_count >= 3 -> give_up_fatal
             z4 = cursor.execute("SELECT status, retry_count FROM videos WHERE douyin_id='ZOMBIE_04'").fetchone()

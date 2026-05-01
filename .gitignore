@@ -12,17 +12,23 @@ venv/
 downloads/
 dist/
 logs/
+douyinsync.db
+douyinsync.db-journal
+douyinsync.db-wal
+douyinsync.db-shm
 docs/project-scan-report.json
 
 # Secrets (CRITICAL)
 config.json
 client_secret.json
+youtube_token.json
 
 # Local scratch / ad-hoc runner logs (repo root)
 out.log
 test_upload.log
 .manual_sync_request
 .manual_force_retry_request
+.hud_scheduler_state.json
 
 # OS generated files
 .DS_Store

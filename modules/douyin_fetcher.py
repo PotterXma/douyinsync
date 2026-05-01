@@ -18,13 +18,13 @@ class DouyinFetcher:
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "gzip, deflate"
         }
-        self.client = httpx.AsyncClient(timeout=15.0)
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.client.aclose()
+    def _fetch_timeout(self) -> float:
+        """HTTP client timeout for Douyin list API (seconds). See ``douyin_fetch_timeout_seconds`` in config.json."""
+        try:
+            return float(config.get("douyin_fetch_timeout_seconds", 15))
+        except (TypeError, ValueError):
+            return 15.0
 
     def _get_cookie_header(self):
         cookie = str(config.get("douyin_cookie", "")).strip()
@@ -102,15 +102,17 @@ class DouyinFetcher:
         api_url = f"https://www.douyin.com/aweme/v1/web/aweme/post/?{query_str}&a_bogus={abogus_str}"
         
         try:
-            # We enforce direct domestic connection (No Proxy) to hit Douyin smoothly usually.
-            response = await self.client.get(api_url, headers=current_headers)
-            response.raise_for_status()
-            data = response.json()
-            
+            # Fresh AsyncClient per call: ``PipelineCoordinator`` uses ``asyncio.run()`` per sync cycle,
+            # which closes the event loop — a long-lived client would raise "Event loop is closed".
+            async with httpx.AsyncClient(timeout=self._fetch_timeout()) as client:
+                response = await client.get(api_url, headers=current_headers)
+                response.raise_for_status()
+                data = response.json()
+
             posts = self._parse_video_list(data)
             next_cursor = data.get("max_cursor", 0)
             has_more = bool(data.get("has_more", 0))
-            
+
             return posts, next_cursor, has_more
         except httpx.RequestError as e:
             logger.error("DouyinFetcher: Network error during fetch. %s", e)

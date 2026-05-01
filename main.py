@@ -5,8 +5,10 @@ import queue
 from pathlib import Path
 
 # ── Logging MUST be configured before any other module import ──────────────
+from utils.paths import data_root
 from utils.logger import setup_logging
-setup_logging()
+
+setup_logging(str(data_root() / "logs"))
 # ───────────────────────────────────────────────────────────────────────────
 
 from modules.logger import logger
@@ -15,7 +17,11 @@ from modules.config_manager import config
 from ui.tray_icon import TrayApp
 from utils.models import AppEvent
 from modules.scheduler import PipelineCoordinator
-from utils.paths import manual_force_retry_request_path, manual_sync_request_path
+from utils.paths import (
+    manual_force_retry_request_path,
+    manual_sync_request_path,
+    reload_config_request_path,
+)
 
 
 def _launch_dashboard_subprocess() -> None:
@@ -27,6 +33,20 @@ def _launch_dashboard_subprocess() -> None:
         project_root = Path(__file__).resolve().parent
         subprocess.Popen(
             [sys.executable, str(project_root / "main.py"), "dashboard"],
+            cwd=str(project_root),
+            close_fds=False,
+        )
+
+
+def _launch_settings_subprocess() -> None:
+    """Spawn settings UI (``main.py settings`` / ``DouyinSync.exe settings``)."""
+    if getattr(sys, "frozen", False):
+        exe_dir = str(Path(sys.executable).parent)
+        subprocess.Popen([sys.executable, "settings"], cwd=exe_dir, close_fds=False)
+    else:
+        project_root = Path(__file__).resolve().parent
+        subprocess.Popen(
+            [sys.executable, str(project_root / "main.py"), "settings"],
             cwd=str(project_root),
             close_fds=False,
         )
@@ -56,6 +76,18 @@ def _consume_manual_force_retry_request_file() -> bool:
         return False
 
 
+def _consume_reload_config_request_file() -> bool:
+    """Settings UI touches ``.reload_config_request`` so the daemon reapplies schedule without tray menu."""
+    p = reload_config_request_path()
+    if not p.is_file():
+        return False
+    try:
+        p.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator):
     """The central data pipeline background loop."""
     logger.info("Background daemon pipeline starting.")
@@ -71,6 +103,10 @@ def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator
     
     # Infinite loop isolated from Windows UI lock.
     while True:
+        if _consume_reload_config_request_file():
+            logger.info("Reload config request file consumed (e.g. from settings dashboard).")
+            if config.reload():
+                coordinator.apply_primary_schedule()
         if _consume_manual_force_retry_request_file():
             logger.info("Manual sync: force-retry request (normalize give_up/failed; bypass per-attempt caps).")
             coordinator.primary_sync_job(force_retry_bypass=True)
@@ -95,6 +131,12 @@ def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator
                     _launch_dashboard_subprocess()
                 except Exception as e:
                     logger.exception("Failed to spawn dashboard subprocess: %s", e)
+            elif event.command == "OPEN_SETTINGS":
+                logger.info("Open settings command received.")
+                try:
+                    _launch_settings_subprocess()
+                except Exception as e:
+                    logger.exception("Failed to spawn settings subprocess: %s", e)
         except queue.Empty:
             pass
             
@@ -163,6 +205,16 @@ if __name__ == "__main__":
             import test_pipeline
             test_pipeline.setup_logging()
             test_pipeline.test_e2e()
+            sys.exit(0)
+        elif sys.argv[1] == "bark_test":
+            # Standalone Bark push test: does not require pipeline execution.
+            from modules.notifier import BarkNotifier
+
+            title = "DouyinSync Bark Test"
+            message = "这是一条测试推送（含铃声）。"
+            if len(sys.argv) > 2 and str(sys.argv[2]).strip():
+                message = str(sys.argv[2]).strip()
+            BarkNotifier().push(title, message, level="active")
             sys.exit(0)
     
     main()

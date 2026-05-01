@@ -1,6 +1,6 @@
 # 数据模型文档
 
-> **最后更新**: 2026-04-22 | **来源**: `utils/models.py`、`modules/database.py`
+> **最后更新**: 2026-05-01 | **来源**: `utils/models.py`、`modules/database.py`、`config.json`
 
 ---
 
@@ -23,7 +23,17 @@ class VideoRecord:
     local_cover_path: Optional[str] = None  # 本地封面路径（JPEG）
     created_at: Optional[int] = None        # Unix 时间戳（首次发现）
     updated_at: Optional[int] = None        # Unix 时间戳（最后更新）
+    # --- SQLite「videos」表扩展（Epic 5 / Dashboard 只读展示）---
+    upload_bytes_done: int = 0              # YouTube 上传已确认字节（节流写库）
+    upload_bytes_total: Optional[int] = None  # 上传总量；NULL 表示未知（不展示假百分比）
+    last_error_summary: Optional[str] = None   # 最近一次失败简短摘要（脱敏后）
+    youtube_video_id: Optional[str] = None     # 成功后 YouTube 视频 ID（可复制）
 ```
+
+持久化层 **`modules/database.py`** 在初始化时对旧库自动 `ALTER TABLE` 补齐上述列；`revert_zombies` 将滞留的 `uploading` 收回 `downloaded` 时会清零 `upload_bytes_*`。
+
+经典 **`videolib`**（`python main.py videolib`）表格数据源为 `VideoDAO.list_videos_for_library`，行元组字段顺序为：  
+`douyin_id, status, account_mark, retry_count, title, local_video_path, updated_at, upload_bytes_done, upload_bytes_total, last_error_summary, youtube_video_id`（契约见 [api-contracts.md](./api-contracts.md) §`list_videos_for_library`）。
 
 #### 状态机转换图
 
@@ -92,9 +102,36 @@ class ProxyConfig:
 ```python
 @dataclass
 class AppEvent:
-    command: str           # 事件指令（如 "show_dashboard"、"reload_config"）
+    command: str                   # 见下表
     payload: Optional[Any] = None  # 附加数据（可选）
 ```
+
+**`main.py` / `ui/tray_icon.py` 使用的 `command` 取值**：
+
+| `command` | 含义 |
+|-------------|------|
+| `EXIT` | 结束守护线程并退出进程 |
+| `RELOAD_CONFIG` | 重新读取 `config.json`；成功则 `apply_primary_schedule()` |
+| `RUN_PIPELINE_NOW` | 立即执行一轮主同步 |
+| `OPEN_DASHBOARD` | 子进程启动 HUD（`dashboard`） |
+| `OPEN_SETTINGS` | 子进程启动搬运时间设置（`settings`） |
+
+---
+
+### `config.json` 扩展键（非 `AppConfig` 强类型字段）
+
+`ConfigManager` 在 `_raw` 中保留完整 JSON。管道常用键包括：
+
+| 键 | 说明 |
+|----|------|
+| `sync_schedule_mode` | `interval` \| `clock`（及别名 `cron` / `daily`，归一化见调度器） |
+| `sync_interval_minutes` | 间隔模式下的周期（分钟）；**设置看板**按小时保存时为其 = 小时×60 |
+| `sync_clock_times` | 字符串数组，`HH:MM`（本地时区） |
+| `cron_hour` / `cron_minute` | 兼容单槽；多点模式下与列表首项同步 |
+| `daily_upload_limit` / `max_videos_per_run` | 每日成功上传上限、每轮管道最多处理条数 |
+| `douyin_accounts` / `douyin_cookie` / `proxies` | 抓取侧配置 |
+
+路径解析：**`utils.paths.data_root()`**；覆盖目录：**环境变量 `DOUYINSYNC_DATA_DIR`**。
 
 ---
 

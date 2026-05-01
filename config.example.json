@@ -1,0 +1,41 @@
+{
+  "douyin_accounts": [
+    {
+      "url": "https://www.douyin.com/user/MS4wLjABAAAA_REPLACE_WITH_USER_PROFILE_URL",
+      "mark": "your_channel_mark",
+      "tab": "post",
+      "enable": true
+    }
+  ],
+  "douyin_cookie": "",
+  "youtube_client_secret_file": "client_secret.json",
+  "youtube_token_file": "youtube_token.json",
+  "youtube_api_token": "",
+  "youtube_proxy": "",
+  "youtube_upload_read_timeout_seconds": 1200,
+  "youtube_upload_write_timeout_seconds": 1200,
+  "youtube_use_first_frame_cover": true,
+  "youtube_category_id": "22",
+  "youtube_privacy_status": "public",
+  "youtube_strip_shorts_hashtag": true,
+  "youtube_upload_thumbnail": false,
+  "youtube_upload_chunk_size_bytes": 8388608,
+  "max_scroll_pages": 5,
+  "sync_schedule_mode": "interval",
+  "sync_interval_minutes": 60,
+  "sync_clock_times": ["08:30"],
+  "cron_hour": 8,
+  "cron_minute": 0,
+  "douyin_fetch_timeout_seconds": 30,
+  "max_videos_per_run": 3,
+  "daily_upload_limit": 5,
+  "storage_retention_days": 7,
+  "proxies": {
+    "http": null,
+    "https": null
+  },
+  "bark_server": "https://api.day.app",
+  "bark_key": "",
+  "bark_sound": "minuet",
+  "bark_url": ""
+}

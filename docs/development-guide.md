@@ -1,6 +1,6 @@
 # 开发指南
 
-> **最后更新**: 2026-04-23 | 面向参与 DouyinSync 开发的工程师
+> **最后更新**: 2026-05-01 | 面向参与 DouyinSync 开发的工程师
 
 ---
 
@@ -9,7 +9,7 @@
 ### 前置要求
 
 - **OS**: Windows 10/11（WinRT OCR 依赖）
-- **Python**: 3.10+（推荐 3.11）
+- **Python**: 3.10+（推荐 3.11）；GitHub CI 在 Windows 上对 **3.10–3.13** 跑全量 `pytest`
 - **权限**: 普通用户即可（无需管理员）
 
 ### 安装依赖
@@ -18,9 +18,17 @@
 pip install -r requirements.txt
 ```
 
+运行单元测试时需额外安装开发依赖（含 `pytest`、`pytest-asyncio`）：
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+测试发现范围与 **asyncio** 模式由仓库根 **`pytest.ini`** 配置（`testpaths=tests`、`asyncio_mode=auto`）。
+
 ### 配置文件
 
-在项目根目录创建 `config.json`：
+在 **`data_root()`**（通常为项目根或 exe 同目录）创建 `config.json`。**完整键说明与调度示例** 以仓库根 **[README.md](../README.md)** 为准；下方为旧版结构示例，若与当前 `config.json` 不一致请以你磁盘上的文件或 README 为准：
 
 ```json
 {
@@ -89,8 +97,9 @@ build.bat
 |--------|------|
 | `dashboard` | CustomTkinter HUD 大盘 |
 | `videolib` | 经典 Tk 视频库（筛选 / 重置 Pending） |
-| `settings` | 设置面板 |
+| `settings` | **搬运时间设置看板**（间隔/定点排期；保存后写 `.reload_config_request`） |
 | `stats` | 统计视图 |
+| `bark_test` | 可选 `[消息]`，测试 Bark 推送（不跑管道） |
 
 示例（冻结目录下，将 `DouyinSync.exe` 换为你的实际路径）：
 

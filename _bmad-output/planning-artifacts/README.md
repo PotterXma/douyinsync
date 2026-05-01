@@ -16,3 +16,5 @@
 | [prd-per-video-upload-progress-ux.md](./prd-per-video-upload-progress-ux.md) | **PRD**：单视频上传/管道进度可感知（待拆 Story） |
 
 配置入口：`_bmad/bmm/config.yaml`。
+
+**与工程文档的衔接**：[docs/bmad-documentation-alignment.md](../../docs/bmad-documentation-alignment.md)（BMAD `document-project` 技能链、`docs/` 与 `_bmad-output/` 分工）；[docs/index.md](../../docs/index.md)（总索引）。

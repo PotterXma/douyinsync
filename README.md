@@ -1,6 +1,6 @@
 # DouyinSync 🚀 (抖音 -> YouTube 全自动搬运引擎)
 
-![Python Version](https://img.shields.io/badge/Python-3.9%2B-blue.svg)
+![Python Version](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
 ![SQLite WAL](https://img.shields.io/badge/Database-SQLite_WAL-success.svg)
 ![State](https://img.shields.io/badge/State-Production_Ready-orange.svg)
 
@@ -57,27 +57,22 @@ graph TD
 
 ## 📦 目录结构 / Structure
 
+运行时 **`config.json`**、**`douyinsync.db`**、**`logs/`**、**`downloads/`** 等路径由 **`utils.paths.data_root()`** 解析：冻结 exe 默认为可执行文件所在目录；源码运行默认为仓库根；可通过环境变量 **`DOUYINSYNC_DATA_DIR`**（绝对路径、已存在目录）覆盖。
+
 ```text
-d:\project\douyin搬运\
- ├─ main.py                    # 启动入口点，承载守护线程与托盘实例化
- ├─ requirements.txt           # 项目构建级依赖包
- ├─ config.json                # (你需要自己创建的)核心行为配置文件
- ├─ client_secret.json         # (你需要从GCP下载的)Google API凭证
- ├─ dist/
- │   └─ douyinsync.db          # 自动生成的本地状态映射库
- ├─ downloads/                 # 核心流媒体中转站 (受清理器保护)
- └─ modules/
-     ├─ config_manager.py      # 配置热重载单例
-     ├─ logger.py              # 带脱敏功能的本地日志
-     ├─ database.py            # SQLite ORM 及僵尸处理
-     ├─ tray_app.py            # Pystray 托盘操作
-     ├─ douyin_fetcher.py      # 抖音用户作品页逆向采集器
-     ├─ downloader.py          # Requests 分块下载与 Pillow WebP 转码
-     ├─ youtube_uploader.py    # Google API 的 OAuth/切片上传总控
-     ├─ scheduler.py           # 串联流水线逻辑的绝对大心脏
-     ├─ dashboard.py           # 可独立抽离的 Tkinter 可视化大盘
-     ├─ sweeper.py             # 7天自动焚毁冗余文件的清道夫
-     └─ notifier.py            # iOS Bark APP 推送集线器
+仓库根/
+ ├─ main.py                 # 入口：守护线程 + 托盘；子命令见下文
+ ├─ requirements.txt · requirements-dev.txt · pytest.ini · config.example.json
+ ├─ modules/                # 管道、抓取、下载、上传、DB、设置看板等
+ ├─ ui/                     # tray_icon（当前主程序托盘）、dashboard_app（HUD）
+ ├─ utils/                  # paths、models、decorators、logger…
+ ├─ tests/                  # pytest
+ ├─ docs/                   # 工程文档索引见 docs/index.md
+ ├─ documents/              # 规范入口，链到 docs/
+ ├─ _bmad/                  # BMM 配置 _bmad/bmm/config.yaml
+ ├─ _bmad-output/           # BMAD 规划与冲刺产出
+ ├─ build.bat · scripts/build_douyinsync.ps1 · DouyinSync.spec   # Windows 打包
+ └─ dist/DouyinSync/        # 构建产物：DouyinSync.exe + 依赖（侧车配置放同目录或 DOUYINSYNC_DATA_DIR）
 ```
 
 ---
@@ -85,32 +80,19 @@ d:\project\douyin搬运\
 ## ⚙️ 快速上手 / Quick Start
 
 ### 1. 环境安装
-目前要求 `Python 3.9+`，打开终端执行：
+目前要求 `Python 3.10+`（推荐 3.11）。CI 在 Windows 上验证 **3.10–3.13**。打开终端执行：
 ```bash
 pip install -r requirements.txt
 ```
 
 ### 2. 初始化核心凭证
-你必须在项目根目录自己准备如下两个**私密**文件：
-*   **`client_secret.json`**：在 Google Cloud Platform 开启 **Youtube Data API v3** 后下载的 OAuth 2.0 Web端桌面客户端授权证书。
-*   **`config.json`**：系统运行的行为大纲，参考如下格式建立：
+在项目根（或 `data_root()`）准备**私密**文件：
 
-```json
-{
-  "douyin_accounts": ["用户的sec_uid 1", "用户的sec_uid 2"],
-  "douyin_cookie": "将你在浏览器中提取的抖音完整Cookie复制到这里",
-  "api_endpoint": "https://www.douyin.com/aweme/v1/web/aweme/post/",
-  "proxies": {
-    "http": "http://127.0.0.1:10809",
-    "https": "http://127.0.0.1:10809"
-  },
-  "youtube_client_secret_file": "client_secret.json",
-  "youtube_category_id": "22",
-  "youtube_privacy_status": "public",
-  "sync_interval_minutes": 30,
-  "bark_url": "https://api.day.app/YOUR_KEY_HERE"
-}
-```
+*   **`client_secret.json`**：Google Cloud 启用 **YouTube Data API v3** 后下载的 OAuth 客户端 JSON。
+*   **`config.json`**：运行参数。**推荐**复制仓库 **`config.example.json`** → `config.json`，再填入抖音 Cookie、Bark Key、`douyin_accounts` 里的主页 URL 等。**勿提交**含真实密钥的 `config.json`（已在 `.gitignore`）；**`youtube_token.json`** 同理（授权后生成，已在 `.gitignore`）。
+
+- **`sync_schedule_mode`**：`interval` 每隔 `sync_interval_minutes` 分钟跑一次主同步；`clock`（或 `cron` / `daily`）按 **`sync_clock_times`** 本地 `HH:MM` 列表跑；未配列表时可退化为 **`cron_hour` + `cron_minute`** 单槽。**「搬运时间设置看板」**（`main.py settings`）在间隔模式下按 **小时** 填写，保存时写入 **`sync_interval_minutes = 小时 × 60`**。
+- **`douyin_fetch_timeout_seconds`**：抖音作品列表 HTTP 超时（秒），默认 `15`。主进程每轮用 `asyncio.run()` 会换事件循环，抓取器内**每次请求新建** `httpx.AsyncClient`，勿复用旧版里长连接跨轮次的假设。
 
 - **`youtube_client_secret_file`**：GCP 控制台下载的 OAuth 客户端 JSON 路径（默认 `client_secret.json`）。与 **`youtube_token_file`**（默认 `youtube_token.json`）、**`youtube_api_token`** 一起，由 `modules/scheduler.py` 传给上传器：日常上传用令牌文件或配置里的 token；**首次浏览器授权**或缺少密钥文件时，会读取该 JSON。
 
@@ -120,13 +102,16 @@ pip install -r requirements.txt
 python main.py
 ```
 > **首次运行重点提示**：
-> 系统探测到你的 YouTube Token 为空时，会自动**强制弹出一个浏览器窗口**，要求你登录目标 YouTube 账号并授权挂载点。授权点一次即可，系统会自动将加密凭证生成到 `dist/youtube_token.json` 内长期使用（即便掉线也会尝试静默刷新）。
+> 系统探测到你的 YouTube Token 为空时，会自动**强制弹出一个浏览器窗口**，要求你登录目标 YouTube 账号并授权挂载点。授权点一次即可，系统会自动将加密凭证生成到 **`data_root()`** 下的 **`youtube_token.json`**（与 exe 同目录或 `DOUYINSYNC_DATA_DIR`）长期使用（即便掉线也会尝试静默刷新）。
 
 启动成功后，您的桌面右下角系统托盘内会出现一个带有 "D" 字母的小图标。
 在图标上点击 **右键** 即可操作 **「🎥 视频状态管理库」**（默认打开 CustomTkinter 实时大盘），或安全关停软件。
 
-- **`python main.py dashboard`**：Epic 5 HUD（全局统计、YouTube 配额条、分账号卡片、最近失败只读列表）；盘内按钮可再打开经典 **视频库** 窗口。
-- **`python main.py videolib`**：经典 Tk 表格（筛选状态、批量重置 Pending），与 HUD 独立进程，互不阻塞托盘主进程。
+- **`python main.py dashboard`**（或 `DouyinSync.exe dashboard`）：Epic 5 HUD（全局统计、YouTube 配额条、分账号卡片、最近失败只读列表）；盘内按钮可再打开经典 **视频库** 窗口。
+- **`python main.py videolib`**：经典 Tk 表格（筛选状态、批量重置 Pending；**F5** 刷新，**双击 / Ctrl+C** 复制，**导出 CSV** 按当前筛选含完整错误摘要）。与 HUD 独立进程，互不阻塞托盘主进程。
+- **`python main.py settings`**：**搬运时间设置看板**（间隔按小时 / 定点 `HH:MM` 逗号分隔）；保存写入 `config.json` 并创建 **`.reload_config_request`**，主进程约 1 秒内重载并重挂 APScheduler（无需再点 Reload，若主进程在跑）。
+- **`python main.py stats`**：统计子窗口。
+- **`python main.py bark_test`**：可选附带一条消息参数，测试 Bark 推送（不跑管道）。
 
 ### 下载失败 / 上传失败时，系统怎么处理？
 
@@ -146,11 +131,16 @@ Dashboard **「手动重新执行（忽略重试上限）」** 会写入 **`.man
 
 ---
 
-## 📋 BMAD 规划与冲刺状态
+## 📋 文档与 BMAD
 
-- 配置：`_bmad/bmm/config.yaml`
-- 规划产出：`_bmad-output/planning-artifacts/`（PRD 快照、Epic/Story、追溯矩阵）
-- 冲刺状态：`_bmad-output/implementation-artifacts/sprint-status.yaml`
+| 入口 | 说明 |
+|------|------|
+| [docs/index.md](docs/index.md) | 工程文档总索引（架构、数据模型、部署、源码树等） |
+| [docs/bmad-documentation-alignment.md](docs/bmad-documentation-alignment.md) | BMAD `document-project` 流程与本仓库路径对齐 |
+| [docs/deployment-guide.md](docs/deployment-guide.md) | PyInstaller 构建、`data_root`、侧车文件与哨兵文件 |
+| [_bmad/bmm/config.yaml](_bmad/bmm/config.yaml) | BMM 路径变量 |
+| [_bmad-output/planning-artifacts/](_bmad-output/planning-artifacts/) | PRD 快照、Epic/Story、追溯矩阵 |
+| [_bmad-output/implementation-artifacts/sprint-status.yaml](_bmad-output/implementation-artifacts/sprint-status.yaml) | 冲刺状态 |
 
 ---
 

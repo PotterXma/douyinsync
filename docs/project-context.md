@@ -1,7 +1,7 @@
 ---
 title: "Project Context: DouyinSync"
-last_updated: "2026-04-21"
-sections_completed: 6
+last_updated: "2026-05-01"
+sections_completed: 7
 description: "Core AI rules, technology stack, and implementation conventions for DouyinSync codebase."
 ---
 
@@ -16,9 +16,10 @@ This document contains the critical rules, architecture decisions, and code patt
 - **Database**: SQLite3 (using `sqlite3` built-in module)
 - **Key Dependencies**:
   - `requests`: Sync HTTP operations and streaming downloads
+  - `httpx`, `aiofiles`: Async HTTP and file I/O for **YouTube resumable uploads** (non-blocking I/O in the async pipeline)
   - `apscheduler`: Background job scheduling (`BackgroundScheduler`)
   - `pystray` & `Pillow`: System tray icon and image format conversions (WebP -> JPEG)
-  - `google-api-python-client`, `google-auth-oauthlib`: YouTube Data API v3 integration
+  - `google-auth-oauthlib` (+ `google.oauth2.credentials`): OAuth 2.0 for YouTube **upload** scope; tokens persisted e.g. `youtube_token.json`
   - Windows 10/11 Native OCR via `winrt.windows.media.ocr`
 
 ## 2. Architecture Overview
@@ -32,7 +33,7 @@ DouyinSync is a background daemon that automatically scrapes Douyin videos, down
 - `modules/scheduler.py`: The `PipelineCoordinator` manages the main sync loop, handles queue tasks, and triggers `apscheduler` jobs.
 - `modules/douyin_fetcher.py`: Scrapes video links (MP4, WebP) from Douyin user profiles by bypassing WAF with `a_bogus`.
 - `modules/downloader.py`: Chunked, stream-based downloading for large files. Automatically creates YouTube-compatible thumbnails with text OCR.
-- `modules/youtube_uploader.py`: Resumable chunked video uploads and custom thumbnail setter to YouTube API.
+- `modules/youtube_uploader.py`: YouTube Data API v3 **resumable upload protocol** via `httpx.AsyncClient`: POST session (`uploadType=resumable`) then **chunked PUT** with `Content-Range` (256 KiB‑aligned chunks), status probe `bytes */total` on errors, optional OAuth refresh between chunks for multi‑hour uploads; optional thumbnail POST when configured.
 - `modules/notifier.py`: Delivers push notifications via the Bark App API.
 - `modules/win_ocr.py`: Synchronous wrapper over Windows Native OCR for extracting text from cover images.
 
@@ -57,7 +58,7 @@ DouyinSync is a background daemon that automatically scrapes Douyin videos, down
        PROJECT_ROOT = Path(__file__).resolve().parent.parent
    ```
 3. **Database Concurrency**: Only use the `AppDatabase` connection context (`with db.get_connection() as conn:`) from `database.py`. The Database is WAL enabled. Do not use raw sqlite3 connects outside this DAO.
-4. **Resumable Downloads/Uploads**: Ensure any file touching I/O handles chunking. Use `iter_content` for downloads and `googleapiclient.http.MediaFileUpload` chunking for YouTube uploads.
+4. **Resumable Downloads/Uploads**: Use streaming/chunking for all large I/O. **Downloads**: `iter_content` (or equivalent) with bounded chunk size. **YouTube uploads**: implement Google’s **resumable upload** with `httpx` (POST metadata → PUT binary chunks with `Content-Range`, handle **308 Resume Incomplete** / **200|201** completion); do **not** rely on `googleapiclient.http.MediaFileUpload` in this codebase for uploads. Long uploads require a refreshable token (**`youtube_token.json` with `refresh_token`**); a static `youtube_api_token` alone cannot rotate credentials mid‑upload.
 5. **Absolute Imports**: Always use absolute imports originating from the project root (`from modules.database import db`). No relative imports.
 
 ❌ **DO NOT:**
@@ -82,10 +83,19 @@ The `videos` table in `douyinsync.db` dictates the flow of state transitions for
 
 - **Douyin WAF**: Relies on specific HTTP parameters (`a_bogus` signature, headers, etc.).
 - **CDN Expiration**: Douyin Video URLs expire. The daemon will auto-refresh the URLs by fetching posts again if a 403 occurs during the download phase.
-- **YouTube API Quotas**: Extremely limited. If the `youtube_uploader` throws a `QuotaExceeded` error (HTTP 403), the loop enters a 24-hour circuit-breaker mode.
+- **YouTube API Quotas**: Extremely limited. If the `youtube_uploader` raises `YoutubeQuotaError` (HTTP 403 `quotaExceeded`), the scheduler engages a **24‑hour** circuit breaker.
 - **Automatic Fallbacks**: Missing the custom `og.jpg` fallback thumbnail generator template will gracefully degrade to a black background image. Missing OCR modules degrade to no-text overlays.
 
 ## 6. Config Updates & Hot Reload
 
 - Notification keys (`bark_server`, `bark_key`), proxies, and upload limits (`daily_upload_limit`, `max_videos_per_run`) are read directly through `config`.
 - `config_manager.ConfigManager` holds a `threading.Lock()` enabling hot reloading of the JSON configuration immediately taking effect for the next operation without application restart.
+- 主同步排期变更：`main.py` 后台循环消费 `.reload_config_request`（由 `settings` 看板保存触发）时调用 `config.reload()` 与 `PipelineCoordinator.apply_primary_schedule()`。
+
+## 7. Documentation map（BMAD / 工程文档）
+
+- **总索引**：[docs/index.md](./index.md)（架构、数据模型、部署、源码树、BMAD 对齐说明等链接）。
+- **BMM 路径变量**：`_bmad/bmm/config.yaml`（`planning_artifacts`、`implementation_artifacts`、`project_knowledge`）。
+- **流程说明**： [bmad-documentation-alignment.md](./bmad-documentation-alignment.md)。
+
+新增或变更跨模块行为时，应同步更新 `docs/` 中对应章节，并在 `index.md` 更新「最后更新」日期。

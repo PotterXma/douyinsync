@@ -1,6 +1,6 @@
 ---
 story_key: 5-5-sqlite-upload-progress-persistence
-status: backlog
+status: done
 epic_ref: Epic 5
 depends_on: []
 blocks: 5-4-dashboard-active-video-and-upload-progress
@@ -8,7 +8,7 @@ blocks: 5-4-dashboard-active-video-and-upload-progress
 
 # Story 5-5-sqlite-upload-progress-persistence
 
-**状态**: backlog  
+**状态**: done  
 
 **产品依据**: [prd-per-video-upload-progress-ux.md](../../planning-artifacts/prd-per-video-upload-progress-ux.md)  
 

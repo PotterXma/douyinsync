@@ -35,9 +35,12 @@ class BarkNotifier:
 
     def push(self, title: str, message: str, level: str = "active"):
         """
-        Sends an immediate push payload to iOS mapped devices.
-        Level: 'active' (default ringing), 'timeSensitive' (critical bypass), 'passive' (silent collection)
-        Config is read fresh each call to support hot-reload.
+        推送至 Bark；URL 带 config 的 ``bark_sound``，一般为有声铃音。
+
+        * ``active``：默认、普通通知+铃声
+        * ``timeSensitive``：时间敏感/更高打扰（仍带 sound，非 silent）
+        * ``passive``：静默、仅进列表（如每日 23:50 汇总，避免刷爆）
+        每次从 config 读入，支持热重载。
         """
         bark_url = self._get_bark_url()
         if not bark_url:

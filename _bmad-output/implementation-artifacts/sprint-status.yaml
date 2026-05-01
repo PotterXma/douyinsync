@@ -2,7 +2,7 @@
 # bmad-sprint-status / sprint-planning 工作流读取本文件。
 
 generated: "2026-04-23T12:00:00Z"
-last_updated: "2026-04-24T00:00:00Z"
+last_updated: "2026-05-01T12:00:00Z"
 project: DouyinSync
 project_key: douyinsync
 tracking_system: file-system
@@ -36,10 +36,10 @@ development_status:
   4-4-manual-run-and-schedule-modes: done
   epic-4-retrospective: done
 
-  epic-5: in_progress
+  epic-5: done
   5-1-ctk-hud-dashboard-subprocess: done
   5-2-classic-videolib-table-and-reset: done
   5-3-settings-stats-subprocess-from-tray: done
-  5-5-sqlite-upload-progress-persistence: backlog
-  5-4-dashboard-active-video-and-upload-progress: backlog
+  5-5-sqlite-upload-progress-persistence: done
+  5-4-dashboard-active-video-and-upload-progress: done
   epic-5-retrospective: done

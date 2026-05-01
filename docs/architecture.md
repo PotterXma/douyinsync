@@ -1,6 +1,6 @@
 # 架构设计文档
 
-> **最后更新**: 2026-04-24 | **版本**: v1.1.1（下载/上传失败重试与 BMAD Story 3.4 对齐）
+> **最后更新**: 2026-05-01 | **版本**: v1.2.1（YouTube 上传：`httpx` 可恢复分块 PUT，文档与实现对齐）
 
 ---
 
@@ -16,7 +16,7 @@ DouyinSync 是一个 **Windows 后台守护进程**，实现抖音视频→YouTu
 │  │ main.py  │───►│         PipelineCoordinator          │   │
 │  │ 入口点   │    │         (scheduler.py / APScheduler) │   │
 │  └──────────┘    └──────────────┬──────────────────────┘    │
-│                                 │ 每 30 分钟触发             │
+│                                 │ 按 interval / clock 触发   │
 │               ┌─────────────────┼─────────────────┐         │
 │               ▼                 ▼                 ▼         │
 │        ┌────────────┐  ┌──────────────┐  ┌──────────────┐  │
@@ -52,7 +52,7 @@ DouyinSync 是一个 **Windows 后台守护进程**，实现抖音视频→YouTu
    本地 downloads/  status=downloaded
    + Win OCR 生成 JPEG 封面
      │
-     ▼ YoutubeUploader（OAuth + resumable MediaFileUpload）
+     ▼ YoutubeUploader（OAuth + httpx 可恢复分块 PUT / Google Resumable Upload）
    YouTube 频道  status=uploaded
 ```
 
@@ -78,7 +78,7 @@ DouyinSync 是一个 **Windows 后台守护进程**，实现抖音视频→YouTu
   3. `DiskSweeper.purge_stale_media()` — 清理旧文件
   4. `DouyinFetcher.fetch_all()` — 抓取新视频
   5. `Downloader.process_pending()` — 下载队列
-  6. `YoutubeUploader.upload_queue()` — 上传队列
+  6. `YoutubeUploader.upload(video)` — 对队列中的视频执行 YouTube 上传（异步）
 
 ### 3.2 抖音抓取器（DouyinFetcher）
 
@@ -110,25 +110,36 @@ DouyinSync 是一个 **Windows 后台守护进程**，实现抖音视频→YouTu
 
 **文件**: `modules/youtube_uploader.py`
 
-- Google OAuth 2.0 鉴权（`token.json` 持久化刷新令牌）
-- `MediaFileUpload(resumable=True)` 分块续传
-- 配额超限（HTTP 403 QuotaError）触发 `@circuit_breaker`，等待至次日 PST 零时
-- 自定义缩略图上传（`thumbnails().set()`）
+- **OAuth 2.0**：`google-auth-oauthlib` / `Credentials`；默认持久化 **`youtube_token.json`**（含 `refresh_token` 方可支撑超长上传）
+- **传输**：独立 **`httpx.AsyncClient`**（可走 `youtube_proxy`），`follow_redirects=False`；**POST** 开启 resumable 会话 → **分块 PUT**（`Content-Range`，块大小默认 8MiB 且为 **256KiB** 整数倍，可配置 `youtube_upload_chunk_size_bytes`）
+- **韧性**：308 **Resume Incomplete** 按 `Range` 推进；网络/5xx 后可 **PUT `Content-Range: bytes */total`** 探测已确认偏移再续传；chunk 级 **401** 依赖磁盘 token 刷新（纯静态 `youtube_api_token` 无法长传续命）
+- **配额**：`YoutubeQuotaError`（403 `quotaExceeded`）在调度层触发 **`@circuit_breaker`**，休眠至次日 PST 零时
+- **缩略图**（可选，`youtube_upload_thumbnail`）：同客户端 **POST** `upload/youtube/v3/thumbnails/set`
 
 ### 3.6 桌面 UI 层
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
-| 系统托盘 | `ui/tray_icon.py` + `modules/tray_app.py` | PyStray 图标、右键菜单 |
+| 系统托盘（主程序） | `ui/tray_icon.py` | PyStray、`AppEvent` → `event_queue` |
+| 系统托盘（可选实现） | `modules/tray_app.py` | 中文菜单版托盘逻辑（与上者不同时启用） |
 | HUD 仪表盘 | `ui/dashboard_app.py` | CustomTkinter 实时状态面板 |
-| 设置面板 | `modules/ui_settings.py` | 配置调整 UI |
+| 搬运时间设置看板 | `modules/ui_settings.py` | 排期间隔/定点；保存 + `.reload_config_request` |
 | 统计视图 | `modules/ui_stats.py` | 历史数据展示 |
 
 **UI 线程规则**：
 - Dashboard 使用 `root.after(3000, poll_db)` 非阻塞轮询（绝不使用 `time.sleep`）
 - 系统托盘点击事件通过 `AppEvent` 传递，不直接调用管道函数
 
-### 3.7 韧性基础设施
+### 3.7 配置热重载与排期重挂
+
+| 触发方式 | 行为 |
+|----------|------|
+| 托盘 **Reload Config**（`RELOAD_CONFIG`） | `config.reload()`；成功则 `apply_primary_schedule()` |
+| **`.reload_config_request`**（设置看板保存） | `main.background_daemon` 每轮优先消费：`config.reload()` + `apply_primary_schedule()` |
+
+所有运行时路径以 **`utils.paths.data_root()`** 为准（见 [api-contracts.md](./api-contracts.md) `utils.paths` 节）。
+
+### 3.8 韧性基础设施
 
 | 组件 | 文件 | 机制 |
 |------|------|------|
@@ -153,7 +164,7 @@ DouyinSync 是一个 **Windows 后台守护进程**，实现抖音视频→YouTu
 
 ```
 抖音 CDN 403 → 自动重抓新 URL → 继续下载
-YouTube 限流 → @auto_retry(max_retries=3, backoff=指数)
+YouTube 上传 → 会话 POST 有限次重试；正文 **分块续传 + 状态探测**（非整段 `@auto_retry` 包裹，避免重复创建视频会话）
 YouTube 配额超限 → @circuit_breaker → 休眠至次日
 ```
 
@@ -185,40 +196,39 @@ BMAD：`_bmad-output/implementation-artifacts/stories/3-4-download-and-upload-fa
 
 - **日志脱敏**: `LogSanitizer` 正则过滤 Cookie、Token、OAuth 凭证
 - **代理隔离**: 所有外部请求统一经由 `ConfigManager.get_proxies()`
-- **热重载**: 配置文件变更无需重启，下次循环自动生效
-- **凭证存储**: OAuth `token.json` 存储在项目根目录（生产环境建议加密）
+- **热重载**: `config.json` 变更可通过托盘 Reload 或 **`.reload_config_request`** 立即重载并重挂主同步任务；其他键下一轮读配置时生效
+- **凭证存储**: OAuth 令牌文件默认位于 **`data_root()`**（如 `youtube_token.json`）；生产环境建议限制目录权限并勿提交版本库
 
 ---
 
 ## 6. 文件结构
 
+路径相对于仓库；**运行时可执行文件与数据根** 见 `utils/paths.py` 与 [source-tree-analysis.md](./source-tree-analysis.md)。
+
 ```
 douyin搬运/
-├── main.py                  # 入口：初始化调度器 + 托盘
-├── config.json              # 运行时配置（不提交 Git）
-├── douyinsync.db            # SQLite 数据库（不提交 Git）
-├── modules/                 # 核心业务逻辑
-│   ├── scheduler.py         # PipelineCoordinator（主调度）
-│   ├── database.py          # AppDatabase + VideoDAO
-│   ├── config_manager.py    # ConfigManager 单例
-│   ├── douyin_fetcher.py    # 抖音 API 抓取
-│   ├── downloader.py        # 视频下载 + 封面生成
-│   ├── youtube_uploader.py  # YouTube 上传
-│   ├── notifier.py          # Bark iOS 推送
-│   ├── sweeper.py           # 磁盘清理
-│   ├── tray_app.py          # 托盘应用逻辑
-│   ├── win_ocr.py           # Windows OCR 封装
-│   └── logger.py            # 日志模块导出
-├── ui/                      # GUI 组件
-│   ├── dashboard_app.py     # CustomTkinter HUD 仪表盘
-│   └── tray_icon.py         # PyStray 托盘图标
-├── utils/                   # 通用工具
-│   ├── models.py            # 数据模型 (Dataclasses)
-│   ├── decorators.py        # 重试/熔断装饰器
-│   ├── exceptions.py        # 自定义异常
-│   ├── logger.py            # 日志配置（轮转 + 脱敏）
-│   └── sanitizer.py         # 日志脱敏过滤器
-├── tests/                   # 单元测试（pytest）
-├── docs/                    # 项目文档（本目录）
-└── downloads/               # 临时下载目录（自动清理）
+├── main.py                  # 入口：守护线程 + 托盘；子命令 dashboard / videolib / settings / stats / bark_test
+├── config.json              # 运行时配置（位于 data_root，不提交 Git）
+├── douyinsync.db            # SQLite（位于 data_root）
+├── modules/
+│   ├── scheduler.py         # PipelineCoordinator + APScheduler
+│   ├── database.py
+│   ├── config_manager.py
+│   ├── douyin_fetcher.py · downloader.py · youtube_uploader.py
+│   ├── notifier.py · sweeper.py
+│   ├── ui_settings.py · ui_stats.py · dashboard.py
+│   ├── tray_app.py          # 可选中文托盘实现
+│   └── …
+├── ui/
+│   ├── tray_icon.py         # 主程序托盘
+│   └── dashboard_app.py
+├── utils/
+│   ├── paths.py             # data_root、哨兵文件路径
+│   ├── models.py · decorators.py · logger.py · sanitizer.py
+│   └── …
+├── tests/
+├── docs/                    # 工程文档（index.md 为总索引）
+├── documents/               # 规范入口 → docs/
+├── _bmad-output/            # BMAD 产出
+└── downloads/               # 缓存目录（位于 data_root）
 ```

@@ -1,14 +1,10 @@
-import sys
+import os
 import json
 import threading
 from pathlib import Path
 from modules.logger import logger
 from utils.models import AppConfig, TargetConfig, ProxyConfig
-
-if getattr(sys, 'frozen', False):
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from utils.paths import data_root
 
 class ConfigParseError(Exception):
     """Raised when the config.json file is malformed or invalid."""
@@ -28,7 +24,7 @@ class ConfigManager:
             with cls._class_lock:
                 if not cls._instance:
                     cls._instance = super(ConfigManager, cls).__new__(cls)
-                    cls._instance.config_file = str(PROJECT_ROOT / "config.json")
+                    cls._instance.config_file = str(data_root() / "config.json")
                     cls._instance._lock = threading.Lock()
                     cls._instance._config = None
                     cls._instance._raw: dict = {}
@@ -113,7 +109,13 @@ class ConfigManager:
 
         self._raw = dict(data)
         self._config = AppConfig(targets=targets, proxies=proxies)
-        logger.info("Configuration loaded successfully via ConfigManager.")
+        dr = (os.environ.get("DOUYINSYNC_DATA_DIR") or "").strip()
+        logger.info(
+            "Configuration loaded via ConfigManager from %s (data root: %s%s)",
+            self.config_file,
+            str(Path(self.config_file).parent),
+            f"; override DOUYINSYNC_DATA_DIR={dr}" if dr else "",
+        )
         return self._config
 
     @property

@@ -36,6 +36,12 @@ def test_tray_menu_actions(mock_image, mock_pystray):
     assert event.command == "OPEN_DASHBOARD"
     mock_icon_instance.notify.assert_called_with("Dashboard Opening", title="DouyinSync")
 
+    app.on_open_settings(mock_icon_instance, None)
+    assert not event_queue.empty()
+    event = event_queue.get()
+    assert event.command == "OPEN_SETTINGS"
+    mock_icon_instance.notify.assert_called_with("正在打开搬运时间设置…", title="DouyinSync")
+
 @patch('ui.tray_icon.pystray')
 @patch('ui.tray_icon.Image')
 def test_tray_exit_action(mock_image, mock_pystray):

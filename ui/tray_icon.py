@@ -33,6 +33,10 @@ class TrayApp:
         self.event_queue.put(AppEvent(command="OPEN_DASHBOARD"))
         icon.notify("Dashboard Opening", title="DouyinSync")
 
+    def on_open_settings(self, icon, item):
+        self.event_queue.put(AppEvent(command="OPEN_SETTINGS"))
+        icon.notify("正在打开搬运时间设置…", title="DouyinSync")
+
     def on_exit(self, icon, item):
         self.event_queue.put(AppEvent(command="EXIT"))
         icon.stop()
@@ -41,6 +45,7 @@ class TrayApp:
         menu = Menu(
             item('Run sync now', self.on_run_pipeline_now),
             item('Open Dashboard', self.on_open_dashboard, default=True),
+            item('搬运时间设置…', self.on_open_settings),
             item('Reload Config', self.on_reload),
             item('Exit', self.on_exit)
         )

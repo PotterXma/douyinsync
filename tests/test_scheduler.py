@@ -117,7 +117,16 @@ async def test_pipeline_async_flow(mock_dependencies):
         'downloaded',
         {'local_video_path': '/mock/vid.mp4', 'local_cover_path': '/mock/cov.jpg', 'retry_count': 0},
     )
-    mock_dependencies['dao'].update_status.assert_any_call('test_dy_1', 'uploaded')
+    mock_dependencies['dao'].update_status.assert_any_call(
+        'test_dy_1',
+        'uploaded',
+        {
+            'youtube_video_id': 'yt_123',
+            'upload_bytes_done': 0,
+            'upload_bytes_total': None,
+            'last_error_summary': None,
+        },
+    )
 
 def test_pipeline_lock_prevents_overlap(mock_dependencies):
     coordinator = PipelineCoordinator()
@@ -229,7 +238,9 @@ async def test_circuit_breaker_trips_on_quota_error(mock_dependencies):
     await coordinator._run_async_cycle()
     
     assert coordinator.youtube_quota_exceeded_until >= now + 86400
-    mock_dependencies['dao'].update_status.assert_any_call('test_quota_fail_1', 'downloaded')
+    mock_dependencies['dao'].update_status.assert_any_call(
+        'test_quota_fail_1', 'downloaded', {'upload_bytes_done': 0, 'upload_bytes_total': None}
+    )
     mock_dependencies['notifier'].return_value.push.assert_called()
 
 @pytest.mark.asyncio
@@ -396,4 +407,13 @@ async def test_first_upload_empty_youtube_id_marks_failed(mock_dependencies):
         "sync_interval_minutes": 60,
     }.get(k, default)
     await coordinator._run_async_cycle()
-    mock_dependencies["dao"].update_status.assert_any_call("dy_up_fail", "failed", {"retry_count": 1})
+    mock_dependencies["dao"].update_status.assert_any_call(
+        "dy_up_fail",
+        "failed",
+        {
+            "retry_count": 1,
+            "upload_bytes_done": 0,
+            "upload_bytes_total": None,
+            "last_error_summary": "Empty YouTube video id",
+        },
+    )

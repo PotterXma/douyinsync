@@ -1,19 +1,14 @@
-import sys
 import sqlite3
 import time
 from pathlib import Path
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from modules.logger import logger
 from utils.models import VideoRecord
+from utils.paths import data_root
 
-if getattr(sys, 'frozen', False):
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-DB_FILE = PROJECT_ROOT / "douyinsync.db"
+DB_FILE = data_root() / "douyinsync.db"
 
 class DatabaseConnectionError(Exception):
     """Specific exception raised when the database connection fails or cannot be initialized."""
@@ -34,6 +29,8 @@ class AppDatabase:
                 # Use a larger busy timeout to avoid 'database is locked' errors
                 cursor.execute("PRAGMA busy_timeout=10000;")
                 self._create_tables(cursor)
+                self._migrate_videos_columns(cursor)
+                conn.commit()
                 journal_mode = cursor.execute("PRAGMA journal_mode;").fetchone()[0]
                 logger.debug("Database initialized. Journal mode: %s", journal_mode)
         except OSError as e:
@@ -61,7 +58,21 @@ class AppDatabase:
                 updated_at INTEGER
             )
         """)
-            
+
+    def _migrate_videos_columns(self, cursor: sqlite3.Cursor) -> None:
+        """Additive schema upgrades for Epic 5 upload progress (5-5)."""
+        cursor.execute("PRAGMA table_info(videos)")
+        existing = {row[1] for row in cursor.fetchall()}
+        specs = [
+            ("upload_bytes_done", "INTEGER NOT NULL DEFAULT 0"),
+            ("upload_bytes_total", "INTEGER"),
+            ("last_error_summary", "TEXT"),
+            ("youtube_video_id", "TEXT"),
+        ]
+        for col, decl in specs:
+            if col not in existing:
+                cursor.execute("ALTER TABLE videos ADD COLUMN %s %s" % (col, decl))
+
     @contextmanager
     def get_connection(self):
         """Context manager for yielding a tracked sqlite connection."""
@@ -85,23 +96,35 @@ db = AppDatabase(DB_FILE)
 
 class VideoDAO:
     """Data Access Object wrapper for handling specific domain queries over AppDatabase."""
-    
+
+    @staticmethod
+    def _col(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+        keys = row.keys()
+        if key not in keys:
+            return default
+        v = row[key]
+        return default if v is None else v
+
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> VideoRecord:
         """Helper to safely map a sqlite row to a VideoRecord."""
         return VideoRecord(
-            douyin_id=row['douyin_id'],
-            account_mark=row['account_mark'],
-            title=row['title'],
-            description=row['description'],
-            video_url=row['video_url'],
-            cover_url=row['cover_url'],
-            status=row['status'],
-            retry_count=row['retry_count'],
-            local_video_path=row['local_video_path'],
-            local_cover_path=row['local_cover_path'],
-            created_at=row['created_at'],
-            updated_at=row['updated_at']
+            douyin_id=row["douyin_id"],
+            account_mark=row["account_mark"],
+            title=row["title"],
+            description=row["description"],
+            video_url=row["video_url"],
+            cover_url=row["cover_url"],
+            status=row["status"],
+            retry_count=row["retry_count"],
+            local_video_path=row["local_video_path"],
+            local_cover_path=row["local_cover_path"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            upload_bytes_done=int(VideoDAO._col(row, "upload_bytes_done", 0) or 0),
+            upload_bytes_total=VideoDAO._col(row, "upload_bytes_total", None),
+            last_error_summary=VideoDAO._col(row, "last_error_summary", None),
+            youtube_video_id=VideoDAO._col(row, "youtube_video_id", None),
         )
 
     @staticmethod
@@ -269,6 +292,21 @@ class VideoDAO:
             return cursor.fetchone()[0]
 
     @staticmethod
+    def count_uploaded_for_account(account_mark: Optional[str]) -> int:
+        """
+        同一 ``account_mark`` 下当前 ``status='uploaded'`` 的行数。
+        下一条即将上传的封面序号 = 返回值 + 1（本行尚未写入 uploaded 时调用）。
+        """
+        mark = account_mark or ""
+        sql = (
+            "SELECT COUNT(*) FROM videos WHERE status = 'uploaded' "
+            "AND IFNULL(account_mark, '') = ?"
+        )
+        with db.get_connection() as conn:
+            row = conn.execute(sql, (mark,)).fetchone()
+            return int(row[0]) if row else 0
+
+    @staticmethod
     def revert_zombies() -> int:
         """
         Self-Healing Mechanism (Story 4.4):
@@ -282,7 +320,8 @@ class VideoDAO:
         """
         sql_revert_uploading = """
             UPDATE videos
-            SET status = 'downloaded', retry_count = retry_count + 1, updated_at = ?
+            SET status = 'downloaded', retry_count = retry_count + 1, updated_at = ?,
+                upload_bytes_done = 0, upload_bytes_total = NULL, last_error_summary = NULL
             WHERE status = 'uploading'
         """
         sql_fail_loop = """
@@ -307,6 +346,73 @@ class VideoDAO:
         now = int(time.time())
         with db.get_connection() as conn:
             conn.execute(sql, (video_url, cover_url, now, douyin_id))
+
+    @staticmethod
+    def update_upload_progress(douyin_id: str, done: int, total: Optional[int]) -> None:
+        """Throttle caller should gate frequency; always refreshes ``updated_at`` for HUD ordering."""
+        now = int(time.time())
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE videos SET upload_bytes_done = ?, upload_bytes_total = ?, updated_at = ? WHERE douyin_id = ?",
+                (max(0, int(done)), total, now, douyin_id),
+            )
+
+    @staticmethod
+    def get_active_pipeline_video() -> Optional[dict[str, Any]]:
+        """
+        Single active row for Dashboard (PRD): earliest ``uploading`` by ``updated_at``,
+        else earliest ``downloading`` / ``processing``.
+        """
+        with db.get_connection() as conn:
+            cur = conn.cursor()
+            row = cur.execute(
+                """
+                SELECT douyin_id, title, account_mark, status,
+                       upload_bytes_done, upload_bytes_total, updated_at
+                FROM videos WHERE status = 'uploading'
+                ORDER BY updated_at ASC LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                row = cur.execute(
+                    """
+                    SELECT douyin_id, title, account_mark, status,
+                           upload_bytes_done, upload_bytes_total, updated_at
+                    FROM videos WHERE status IN ('downloading', 'processing')
+                    ORDER BY updated_at ASC LIMIT 1
+                    """
+                ).fetchone()
+            if not row:
+                return None
+            return {
+                "douyin_id": row["douyin_id"],
+                "title": row["title"] or "",
+                "account_mark": row["account_mark"] or "",
+                "status": row["status"],
+                "upload_bytes_done": int(row["upload_bytes_done"] or 0),
+                "upload_bytes_total": row["upload_bytes_total"],
+                "updated_at": row["updated_at"],
+            }
+
+    @staticmethod
+    def get_latest_uploaded_snapshot() -> Optional[dict[str, Any]]:
+        """Most recently uploaded row (for Dashboard «recent success» line)."""
+        sql = """
+            SELECT douyin_id, title, account_mark, youtube_video_id, updated_at
+            FROM videos WHERE status = 'uploaded'
+            ORDER BY updated_at DESC LIMIT 1
+        """
+        with db.get_connection() as conn:
+            row = conn.cursor().execute(sql).fetchone()
+            if not row:
+                return None
+            return {
+                "douyin_id": row["douyin_id"],
+                "title": row["title"] or "",
+                "account_mark": row["account_mark"] or "",
+                "youtube_video_id": row["youtube_video_id"] or "",
+                "updated_at": row["updated_at"],
+            }
 
     @staticmethod
     def get_pipeline_stats() -> dict[str, int]:
@@ -372,11 +478,14 @@ class VideoDAO:
     def list_videos_for_library(filter_status: Optional[str] = None, limit: int = 500) -> list[tuple]:
         """
         Classic videolib Treeview rows:
-        (douyin_id, status, account_mark, retry_count, title, local_video_path).
+        (douyin_id, status, account_mark, retry_count, title, local_video_path, updated_at,
+        upload_bytes_done, upload_bytes_total, last_error_summary, youtube_video_id).
+        ``updated_at`` is Unix seconds; UI can format as Beijing wall time.
         ``filter_status`` is an exact DB status value, or None for all rows.
         """
         sql = (
-            "SELECT douyin_id, status, account_mark, retry_count, title, local_video_path "
+            "SELECT douyin_id, status, account_mark, retry_count, title, local_video_path, updated_at, "
+            "COALESCE(upload_bytes_done, 0), upload_bytes_total, last_error_summary, youtube_video_id "
             "FROM videos"
         )
         params: list = []
@@ -391,13 +500,18 @@ class VideoDAO:
 
     @staticmethod
     def bulk_reset_to_pending(douyin_ids: list[str]) -> int:
-        """Sets status=pending and retry_count=0 for the given douyin_ids. Returns affected row count."""
+        """
+        Sets ``status=pending`` and ``retry_count=0``; clears operator-visible/error/UI carry-over fields
+        so the next pipeline pass starts clean (``last_error_summary``, upload progress, stale YouTube id).
+        """
         if not douyin_ids:
             return 0
         now = int(time.time())
         placeholders = ",".join("?" * len(douyin_ids))
         sql = (
-            f"UPDATE videos SET status = 'pending', retry_count = 0, updated_at = ? "
+            f"UPDATE videos SET status = 'pending', retry_count = 0, updated_at = ?, "
+            f"last_error_summary = NULL, upload_bytes_done = 0, upload_bytes_total = NULL, "
+            f"youtube_video_id = NULL "
             f"WHERE douyin_id IN ({placeholders})"
         )
         params: tuple = (now, *douyin_ids)

@@ -1,6 +1,6 @@
 # API 契约文档
 
-> **最后更新**: 2026-04-22 | **覆盖模块**: VideoDAO、ConfigManager、BarkNotifier、DiskSweeper
+> **最后更新**: 2026-05-01 | **覆盖模块**: VideoDAO、ConfigManager、BarkNotifier、DiskSweeper、`utils.paths`
 
 ---
 
@@ -124,7 +124,8 @@ def get_pipeline_stats() -> dict[str, int]
 ```python
 {"pending": 12, "uploaded": 180, "failed": 3, "give_up_fatal": 1}
 ```
-**用途**: Dashboard UI 每 3 秒轮询一次用于实时展示。
+**用途**: Dashboard UI 每 3 秒轮询一次用于实时展示。  
+**同步任务条（5-1 补充）**: 同目录下主进程会写入 `utils.paths.hud_scheduler_state_path()`（即项目根目录 `.hud_scheduler_state.json`）JSON，子进程只读，用于在 HUD 顶栏显示主同步「任务名、计划说明、北京时间的下次调度、APScheduler/主管道是否忙碌」。`updated_at` 超过约 30 秒未刷新时 Dashboard 退化为仅展示 `config.json` 计划推断并提示主进程可能未开。
 
 ---
 
@@ -160,8 +161,10 @@ def list_videos_for_library(filter_status: Optional[str] = None, limit: int = 50
 ```
 
 **职责**: 为经典视频库表格返回行元组  
-`(douyin_id, status, account_mark, retry_count, title, local_video_path)`。  
-`filter_status` 为 SQLite 中精确的 `status` 值，或 `None` 表示不按状态过滤。
+`(douyin_id, status, account_mark, retry_count, title, local_video_path, updated_at, upload_bytes_done, upload_bytes_total, last_error_summary, youtube_video_id)`。  
+`updated_at` 为 Unix 秒（状态/记录最近变更），UI 可展示为北京时间；进度与摘要、`youtube_video_id` 供 `videolib` 展示。  
+`filter_status` 为 SQLite 中精确的 `status` 值，或 `None` 表示不按状态过滤。  
+``limit`` 默认 **500**；**videolib** 表格使用 ``VIDEOLIB_TABLE_ROW_LIMIT``（500），**导出 CSV** 使用 ``VIDEOLIB_EXPORT_ROW_LIMIT``（5000），见 ``modules/dashboard.py``。
 
 ---
 
@@ -172,7 +175,8 @@ def list_videos_for_library(filter_status: Optional[str] = None, limit: int = 50
 def bulk_reset_to_pending(douyin_ids: list[str]) -> int
 ```
 
-**职责**: 将给定 `douyin_id` 批量置为 `pending` 且 `retry_count=0`；返回受影响行数。  
+**职责**: 将给定 `douyin_id` 批量置为 `pending` 且 `retry_count=0`；同时清空  
+`last_error_summary`、`upload_bytes_done` / `upload_bytes_total`、`youtube_video_id`，避免纠偏后 UI/管道残留旧状态；返回受影响行数。  
 **用途**: `modules/dashboard.py`（`videolib`）重置选中任务。
 
 ---
@@ -183,6 +187,8 @@ def bulk_reset_to_pending(douyin_ids: list[str]) -> int
 **模式**: 线程安全单例（`threading.Lock`）  
 **实例**: `from modules.config_manager import config`（已导出）
 
+无密钥模板：**`config.example.json`**（与 CI / `test_config_manager` 对齐）。下列键若残留在旧版 `config.json` 中，**当前主干未读取**（可删以减少误导）：`max_videos_per_check`、`max_retry`、`download_dir`、`delete_after_upload`、顶层 **`proxy`**（抖音 HTTP 客户端尚未绑定该字段；YouTube 上传代理请用 **`youtube_proxy`**）。
+
 ---
 
 ### `load_config`
@@ -191,10 +197,10 @@ def bulk_reset_to_pending(douyin_ids: list[str]) -> int
 def load_config(self) -> AppConfig
 ```
 
-**职责**: 从 `config.json` 读取并解析为强类型 `AppConfig`。  
+**职责**: 从 `config.json` 读取并解析为强类型 `AppConfig`，同时将完整 JSON 根存入 **`_raw`** 供 `get()` 读取管道专用键（如 `douyin_accounts`）。  
 **异常**:
 - `ConfigNotFoundError` — 文件不存在，**阻断启动**
-- `ConfigParseError` — JSON 格式错误或缺少 `targets` 字段，**阻断启动**
+- `ConfigParseError` — JSON 无效、`proxies`/`targets` 条目 malformed（如缺少 `douyin_id`）等，**阻断启动**
 
 ---
 
@@ -204,8 +210,7 @@ def load_config(self) -> AppConfig
 def get(self, key: str, default=None) -> Any
 ```
 
-**注意**: 遗留兼容接口，新代码应直接访问 `config.config` 获取强类型对象。  
-**支持键**: `"proxies"`（返回 `dict`），其他键返回 `default`。
+**注意**: 会先 `load_config()`；除 **`proxies`** 走 `get_proxies()` 外，其余键从 **`_raw`** 读取（不存在则 `default`）。管道大量使用此方法读取 `douyin_accounts`、`sync_*`、`youtube_*` 等。
 
 ---
 
@@ -295,6 +300,39 @@ def purge_stale_media(self, max_age_days: int = 7) -> None
 **职责**: 递归扫描 `downloads/` 目录，删除超过 `max_age_days` 天的 `.mp4`、`.webp`、`.jpg` 文件。  
 **容错**: 单文件删除失败（权限、占用）仅 warning 跳过，不中断整体清扫。  
 **推荐调用**: 每次调度循环开始前调用一次。
+
+---
+
+## `utils.paths` — 数据根与哨兵文件
+
+**位置**: `utils/paths.py`  
+**职责**: 统一 **开发树 / PyInstaller 冻结目录 / 可选数据目录覆盖** 下的路径解析。
+
+### `data_root` → `Path`
+
+```python
+def data_root() -> Path
+```
+
+- **冻结**（`sys.frozen`）：默认可执行文件所在目录。  
+- **源码**：仓库根（`utils` 的上一级）。  
+- **覆盖**：环境变量 **`DOUYINSYNC_DATA_DIR`** 为已存在的绝对路径目录时优先返回其 `resolve()`。
+
+`ConfigManager`、`setup_logging`、`VideoDAO` 使用的 `config.json`、`douyinsync.db`、`logs/`、`downloads/` 等均应相对于此根（除非另有显式配置路径）。
+
+### 进程间请求文件（touch 后由主循环消费）
+
+| 函数 | 文件名 | 消费方 |
+|------|--------|--------|
+| `manual_sync_request_path()` | `.manual_sync_request` | `main.background_daemon` → 跑一轮 `primary_sync_job` |
+| `manual_force_retry_request_path()` | `.manual_force_retry_request` | 同上 + `force_retry_bypass=True` 与 DB 归一化 |
+| `reload_config_request_path()` | `.reload_config_request` | `config.reload()` + `PipelineCoordinator.apply_primary_schedule()` |
+
+**写入方**: CustomTkinter HUD / **设置看板**（`modules/ui_settings.save_settings`）等子进程；**删除方**: 主进程成功处理后 `unlink`。
+
+### `hud_scheduler_state_path`
+
+主进程周期性写入 **`.hud_scheduler_state.json`**，供 `dashboard` 子进程只读展示下次触发时间等。
 
 ---
 

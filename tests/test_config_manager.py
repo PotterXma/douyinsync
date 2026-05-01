@@ -1,9 +1,14 @@
-import pytest
+import json
 import os
 import tempfile
-import json
+from pathlib import Path
+
+import pytest
+
 from modules.config_manager import ConfigManager, ConfigNotFoundError, ConfigParseError
-from utils.models import AppConfig, TargetConfig, ProxyConfig
+from utils.models import AppConfig, ProxyConfig
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_config_not_found() -> None:
     manager = ConfigManager("nonexistent_config.json")
@@ -118,3 +123,16 @@ def test_get_reads_raw_json_keys() -> None:
         assert manager.get("missing_key", "dflt") == "dflt"
     finally:
         os.unlink(config_path)
+
+
+def test_config_example_json_repo_template_loads() -> None:
+    """Shipped ``config.example.json`` must stay valid JSON and parseable by ConfigManager."""
+    path = _REPO_ROOT / "config.example.json"
+    assert path.is_file(), "config.example.json missing at repo root"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(raw.get("douyin_accounts"), list)
+    mgr = ConfigManager(str(path))
+    cfg = mgr.load_config()
+    assert isinstance(cfg, AppConfig)
+    assert mgr.get("youtube_proxy", "unset") == ""
+    assert mgr.get("youtube_use_first_frame_cover", False) is True

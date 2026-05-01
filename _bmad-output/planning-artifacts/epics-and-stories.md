@@ -1,6 +1,6 @@
 # DouyinSync — Epic 与用户故事（全量补档）
 
-> 与 `PRD-snapshot.md`、`docs/architecture.md` 一致。**状态**：Epic 1～4 与 Epic 5 的 5-1～5-3 已落地（done）；**Epic 5 扩展** Story **5-4 / 5-5** 见下文，当前为 **backlog**（见 `sprint-status.yaml`）。
+> 与 `PRD-snapshot.md`、`docs/architecture.md` 一致。**状态**：Epic 1～5 已落地（含 **5-4 / 5-5** 上传进度与 Dashboard 当前任务）；详见 `sprint-status.yaml`。
 
 ---
 
@@ -181,7 +181,7 @@
 
 **目标**：子进程隔离 GUI；只读 HUD；可选写库管理库。
 
-**扩展（2026-04-24）**：单条管道活动与 YouTube 上传百分比可感知，产品说明见 [prd-per-video-upload-progress-ux.md](./prd-per-video-upload-progress-ux.md)。实现拆为 **5-5**（SQLite 持久化进度）→ **5-4**（Dashboard 展示）。
+**扩展（2026-04-24）**：单条管道活动与 YouTube 上传百分比可感知，产品说明见 [prd-per-video-upload-progress-ux.md](./prd-per-video-upload-progress-ux.md)。**5-5**（SQLite 持久化进度）与 **5-4**（Dashboard 展示）已于 2026-05-01 落地。
 
 ### Story 5-1：CustomTkinter HUD（`dashboard`）
 

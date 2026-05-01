@@ -1,50 +1,65 @@
 @echo off
+REM build.bat          - interactive (pause at end)
+REM build.bat nopause  - CI / automation (no pause)
+REM set SKIP_BUILD_PAUSE=1 - same as nopause
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-echo [*] 结束可能占用输出文件的进程...
+REM UTF-8 console when supported (reduces mojibake in Cursor/VS integrated terminal)
+chcp 65001 >nul 2>&1
 
-echo     - DouyinSync.exe ^(已安装/打包运行实例^)
+echo [*] Stopping processes that may lock build outputs...
+echo     - DouyinSync.exe
 taskkill /F /IM DouyinSync.exe /T >nul 2>&1
 
-echo     - 本目录下以 main.py 启动的 python.exe / pythonw.exe ^(开发调试^)
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$root = (Resolve-Path -LiteralPath '.').Path; ^
-  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ^
-  Where-Object { ^
-    $_.Name -match '^(python|pythonw)\\.exe$' -and ^
-    $_.CommandLine -and ^
-    ($_.CommandLine -like ('*' + $root + '*main.py*')) ^
-  } | ForEach-Object { ^
-    Write-Host ('    PID ' + $_.ProcessId + ' ' + $_.Name); ^
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue ^
-  }"
+echo     - python.exe / pythonw.exe (this repo main.py)
+REM 2>nul: hide PowerShell stderr (often garbled under OEM code pages)
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\build_kill_dev_python.ps1" 2>nul
+if errorlevel 1 echo [WARN] Kill-helper script returned non-zero, continuing...
 
-REM 给文件锁一点时间释放（可选）
-timeout /t 1 /nobreak >nul
+REM timeout breaks when stdin is redirected (e.g. IDE); ping is a portable 1s delay
+ping 127.0.0.1 -n 2 >nul
 
-echo [*] 清理中间产物...
-if exist build rmdir /s /q build
-if exist dist\_staging rmdir /s /q dist\_staging
+echo [*] Cleaning staging dirs...
+if exist "build" rmdir /s /q "build"
+if exist "dist\_staging" rmdir /s /q "dist\_staging"
 
-echo [*] PyInstaller ^(DouyinSync.spec^)...
-pyinstaller --noconfirm --distpath dist\_staging --workpath build DouyinSync.spec
-if errorlevel 1 (
-  echo [ERROR] PyInstaller 失败，退出码 %ERRORLEVEL%
-  exit /b 1
+echo [*] PyInstaller (DouyinSync.spec)...
+pyinstaller --noconfirm --distpath "dist\_staging" --workpath "build" "DouyinSync.spec"
+if errorlevel 1 goto :fail_pyi
+
+echo [*] Sync to dist\DouyinSync (merge, keep sidecar files)...
+if not exist "dist\DouyinSync" mkdir "dist\DouyinSync"
+xcopy /E /I /H /Y "dist\_staging\DouyinSync\*" "dist\DouyinSync\" >nul
+if errorlevel 1 goto :fail_xcopy
+
+echo [*] Preparing run folder...
+if not exist "dist\DouyinSync\config.json" (
+  if exist "config.json" copy /Y "config.json" "dist\DouyinSync\" >nul 2>&1
 )
+if not exist "dist\DouyinSync\config.json" if exist "config.example.json" copy /Y "config.example.json" "dist\DouyinSync\config.json" >nul 2>&1
+if not exist "dist\DouyinSync\client_secret.json" copy /Y "client_secret.json" "dist\DouyinSync\" >nul 2>&1
+if not exist "dist\DouyinSync\logs" mkdir "dist\DouyinSync\logs"
+if not exist "dist\DouyinSync\downloads" mkdir "dist\DouyinSync\downloads"
 
-echo [*] 同步到 dist\DouyinSync ^(保留旁路数据文件^)...
-if not exist dist\DouyinSync mkdir dist\DouyinSync
-xcopy /E /I /H /Y dist\_staging\DouyinSync\* dist\DouyinSync\ >nul
+echo [SUCCESS] Build done.
+echo     Run: dist\DouyinSync\DouyinSync.exe
+goto :maybe_pause
 
-echo [*] 准备运行目录...
-if not exist dist\DouyinSync\config.json copy /Y config.json dist\DouyinSync\ >nul 2>&1
-if not exist dist\DouyinSync\client_secret.json copy /Y client_secret.json dist\DouyinSync\ >nul 2>&1
-if not exist dist\DouyinSync\logs mkdir dist\DouyinSync\logs
-if not exist dist\DouyinSync\downloads mkdir dist\DouyinSync\downloads
-
-echo [SUCCESS] 构建完成。
-echo     运行: dist\DouyinSync\DouyinSync.exe
-pause
+:fail_pyi
+echo [ERROR] PyInstaller failed. Code %ERRORLEVEL%
 endlocal
+exit /b 1
+
+:fail_xcopy
+echo [ERROR] xcopy sync failed. Code %ERRORLEVEL%
+endlocal
+exit /b 1
+
+:maybe_pause
+if /I "%~1"=="nopause" goto :finish
+if defined SKIP_BUILD_PAUSE goto :finish
+pause
+:finish
+endlocal
+goto :eof

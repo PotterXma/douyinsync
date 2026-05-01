@@ -1,147 +1,193 @@
-import sys
-import tkinter as tk
-from tkinter import ttk, messagebox
 import json
-from pathlib import Path
+import re
+import tkinter as tk
+from tkinter import messagebox, ttk
 
-if getattr(sys, 'frozen', False):
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from utils.paths import data_root, reload_config_request_path
 
-CONFIG_FILE = PROJECT_ROOT / "config.json"
+CONFIG_FILE = data_root() / "config.json"
+
+
+def _minutes_to_display_hours(minutes: int) -> int:
+    """Map stored minutes to spinbox hours (ceil), at least 1."""
+    try:
+        m = max(1, int(minutes))
+    except (TypeError, ValueError):
+        m = 60
+    return max(1, (m + 59) // 60)
+
+
+def _parse_clock_times(raw: str) -> list[str]:
+    """Accept English/Chinese commas and newlines; return normalized HH:MM strings."""
+    slots: list[str] = []
+    for chunk in re.split(r"[\s,，;；]+", (raw or "").strip()):
+        part = chunk.strip()
+        if not part or part.startswith("#"):
+            continue
+        if ":" not in part:
+            raise ValueError("时间点需为 HH:MM 格式，无效片段: %r" % (part,))
+        a, b = part.split(":", 1)
+        h = int(a.strip())
+        m = int(b.strip())
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("时间越界: %r" % (part,))
+        slots.append("%02d:%02d" % (h, m))
+    if not slots:
+        raise ValueError("请至少填写一个执行时间点（如 06:30 或 08:00,20:00）")
+    return slots
+
+
+def _touch_reload_request() -> None:
+    try:
+        reload_config_request_path().touch(exist_ok=True)
+    except OSError:
+        pass
 
 
 class SettingsDashboard:
-    def __init__(self, root):
+    """搬运时间设置看板：间隔（按小时）与定点（本地 HH:MM，逗号分隔）。"""
+
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("搬运时间设置看板 | 同步计划")
-        self.root.geometry("520x480")
-        
-        self.config = {}
+        self.root.title("搬运时间设置看板")
+        self.root.geometry("520x320")
+        self.root.minsize(480, 280)
+
+        self.config: dict = {}
         if CONFIG_FILE.exists():
             try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     self.config = json.load(f)
             except Exception:
                 pass
-                
-        frame = tk.Frame(self.root, padx=20, pady=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-        
-        tk.Label(frame, text="全局自动化调度", font=("Arial", 12, "bold")).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky=tk.W)
 
         mode = str(self.config.get("sync_schedule_mode", "interval") or "interval").lower()
         if mode not in ("interval", "clock"):
             mode = "interval"
         self.mode_var = tk.StringVar(value=mode)
 
-        tk.Label(frame, text="调度方式:").grid(row=1, column=0, sticky=tk.W, pady=4)
-        modes = tk.Frame(frame)
-        modes.grid(row=1, column=1, sticky=tk.W, pady=4)
-        tk.Radiobutton(modes, text="按间隔（每 N 分钟）", variable=self.mode_var, value="interval", command=self._toggle_mode_fields).pack(anchor=tk.W)
-        tk.Radiobutton(modes, text="按固定时刻（本地 HH:MM，可多行）", variable=self.mode_var, value="clock", command=self._toggle_mode_fields).pack(anchor=tk.W)
+        outer = tk.Frame(self.root, padx=16, pady=12)
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(frame, text="间隔（分钟）:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.interval_var = tk.StringVar(value=str(self.config.get("sync_interval_minutes", 60)))
-        self.interval_entry = ttk.Entry(frame, textvariable=self.interval_var, width=12)
-        self.interval_entry.grid(row=2, column=1, sticky=tk.W, pady=5)
+        lf_mode = tk.LabelFrame(outer, text="调度模式选择", padx=10, pady=8)
+        lf_mode.pack(fill=tk.X, pady=(0, 10))
 
-        tk.Label(frame, text="固定时刻（每行 HH:MM）:").grid(row=3, column=0, sticky=tk.NW, pady=5)
-        times_lines = self._initial_clock_lines()
-        self.times_text = tk.Text(frame, width=22, height=6, font=("Consolas", 10))
-        self.times_text.grid(row=3, column=1, sticky=tk.W, pady=5)
-        self.times_text.insert("1.0", times_lines)
+        tk.Radiobutton(
+            lf_mode,
+            text="1. 间隔模式（如：每过 N 小时执行一次）",
+            variable=self.mode_var,
+            value="interval",
+            command=self._toggle_mode_fields,
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=2)
+        tk.Radiobutton(
+            lf_mode,
+            text="2. 定点模式（如：每天 08:00, 20:00 执行）",
+            variable=self.mode_var,
+            value="clock",
+            command=self._toggle_mode_fields,
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=2)
 
-        tk.Label(frame, text="单次最高抓取限制数:").grid(row=4, column=0, sticky=tk.W, pady=5)
-        self.limit_var = tk.StringVar(value=str(self.config.get("max_videos_per_run", "5")))
-        self.limit_entry = ttk.Entry(frame, textvariable=self.limit_var, width=12)
-        self.limit_entry.grid(row=4, column=1, sticky=tk.W, pady=5)
+        lf_params = tk.LabelFrame(outer, text="参数设置", padx=10, pady=8)
+        lf_params.pack(fill=tk.X, pady=(0, 12))
 
-        tk.Label(
-            frame,
-            text="保存后请在托盘菜单点「Reload Config」以立即重载排期。",
-            font=("Arial", 9),
-            fg="#555",
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        row_i = tk.Frame(lf_params)
+        row_i.pack(fill=tk.X, pady=6)
+        tk.Label(row_i, text="执行间隔 (小时):").pack(side=tk.LEFT, padx=(0, 8))
+        im = self.config.get("sync_interval_minutes", 240)
+        self.hours_var = tk.StringVar(value=str(_minutes_to_display_hours(im)))
+        self.spin_hours = tk.Spinbox(
+            row_i,
+            from_=1,
+            to=168,
+            width=6,
+            textvariable=self.hours_var,
+            justify=tk.RIGHT,
+        )
+        self.spin_hours.pack(side=tk.LEFT)
 
-        save_btn = ttk.Button(frame, text="保存到 config.json", command=self.save_settings)
-        save_btn.grid(row=6, column=0, columnspan=2, pady=18)
+        row_t = tk.Frame(lf_params)
+        row_t.pack(fill=tk.X, pady=6)
+        tk.Label(row_t, text="执行时间点:").pack(side=tk.LEFT, padx=(0, 8))
+        self.times_var = tk.StringVar(value=self._initial_clock_string())
+        self.times_entry = ttk.Entry(row_t, textvariable=self.times_var, width=22)
+        self.times_entry.pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(row_t, text="(用英文逗号分隔，如 08:00, 20:00)", fg="#555").pack(side=tk.LEFT)
+
+        hint = tk.Label(
+            outer,
+            text="保存后若主程序（托盘）正在运行，将自动重载排期；单独打开本窗口时请重新启动主程序或点托盘「Reload Config」。",
+            font=("Segoe UI", 8),
+            fg="#666",
+            wraplength=480,
+            justify=tk.LEFT,
+        )
+        hint.pack(fill=tk.X, pady=(0, 6))
+
+        bar = tk.Frame(outer)
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Button(bar, text="保存并生效", command=self.save_settings).pack(side=tk.RIGHT)
 
         self._toggle_mode_fields()
 
-    def _initial_clock_lines(self) -> str:
+    def _initial_clock_string(self) -> str:
         raw = self.config.get("sync_clock_times")
         if isinstance(raw, list) and raw:
-            lines = [str(x).strip() for x in raw if str(x).strip()]
-            if lines:
-                return "\n".join(lines) + "\n"
+            parts = [str(x).strip() for x in raw if str(x).strip()]
+            if parts:
+                return ", ".join(parts)
         try:
-            h = int(self.config.get("cron_hour", 2))
-            m = int(self.config.get("cron_minute", 0))
-            return "%02d:%02d\n" % (h, m)
+            h = int(self.config.get("cron_hour", 6))
+            m = int(self.config.get("cron_minute", 30))
+            return "%02d:%02d" % (h, m)
         except (TypeError, ValueError):
-            return "02:00\n"
+            return "06:30"
 
     def _toggle_mode_fields(self) -> None:
         use_interval = self.mode_var.get() == "interval"
-        state_i = "normal" if use_interval else "disabled"
-        state_t = "normal" if not use_interval else "disabled"
-        self.interval_entry.configure(state=state_i)
-        self.times_text.configure(state=state_t)
+        self.spin_hours.configure(state="normal" if use_interval else "disabled")
+        self.times_entry.configure(state="disabled" if use_interval else "normal")
 
     def save_settings(self) -> None:
         try:
-            limit = int(self.limit_var.get())
             mode = self.mode_var.get()
             if mode not in ("interval", "clock"):
                 raise ValueError("无效的调度方式")
 
             if mode == "interval":
-                interval = int(self.interval_var.get())
-                if interval < 1:
-                    raise ValueError("间隔至少为 1 分钟")
+                h = int(self.hours_var.get())
+                if h < 1:
+                    raise ValueError("间隔至少为 1 小时")
                 self.config["sync_schedule_mode"] = "interval"
-                self.config["sync_interval_minutes"] = interval
+                self.config["sync_interval_minutes"] = h * 60
             else:
-                raw_body = self.times_text.get("1.0", "end")
-                slots: list[str] = []
-                for line in raw_body.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if ":" not in line:
-                        raise ValueError("每行需为 HH:MM 格式: %r" % (line,))
-                    a, b = line.split(":", 1)
-                    h = int(a.strip())
-                    m = int(b.strip())
-                    if not (0 <= h <= 23 and 0 <= m <= 59):
-                        raise ValueError("时间越界: %r" % (line,))
-                    slots.append("%02d:%02d" % (h, m))
-                if not slots:
-                    raise ValueError("请至少填写一行固定时刻")
+                slots = _parse_clock_times(self.times_var.get())
                 self.config["sync_schedule_mode"] = "clock"
                 self.config["sync_clock_times"] = slots
-                if slots:
-                    h0, m0 = int(slots[0][:2]), int(slots[0][3:5])
-                    self.config["cron_hour"] = h0
-                    self.config["cron_minute"] = m0
+                h0, m0 = int(slots[0][:2]), int(slots[0][3:5])
+                self.config["cron_hour"] = h0
+                self.config["cron_minute"] = m0
 
-            self.config["max_videos_per_run"] = limit
-
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=4, ensure_ascii=False)
 
-            messagebox.showinfo("成功", "已写入 config.json。\n请在托盘菜单执行 Reload Config 以应用排期。")
+            _touch_reload_request()
+            messagebox.showinfo(
+                "已保存",
+                "已写入 config.json，并已通知主进程重载排期（若托盘程序正在运行）。\n"
+                "若当前仅单独打开了本窗口，请启动主程序或手动 Reload Config。",
+            )
             self.root.destroy()
         except ValueError as e:
             messagebox.showerror("无效输入", str(e))
 
 
-def run_settings_ui():
+def run_settings_ui() -> None:
     app = tk.Tk()
     SettingsDashboard(app)
     app.mainloop()
+
 
 if __name__ == "__main__":
     run_settings_ui()

@@ -30,6 +30,10 @@ class VideoRecord:
     local_cover_path: Optional[str] = None
     created_at: Optional[int] = None
     updated_at: Optional[int] = None
+    upload_bytes_done: int = 0
+    upload_bytes_total: Optional[int] = None
+    last_error_summary: Optional[str] = None
+    youtube_video_id: Optional[str] = None
 
 class YoutubeUploadError(Exception):
     pass
@@ -38,6 +42,12 @@ class YoutubeQuotaError(YoutubeUploadError):
     pass
 
 class YoutubeNetworkError(YoutubeUploadError):
+    pass
+
+
+class YoutubeUploadInterrupted(Exception):
+    """Do not inherit YoutubeUploadError — avoids @auto_retry re-running upload when the loop is shutting down."""
+
     pass
 
 @dataclass

@@ -131,15 +131,23 @@ class TestDownloader:
             dest.write_bytes(b"FAKE_CONTENT")
             return True
             
-        with patch.object(self.downloader, "_download_file", new_callable=AsyncMock, side_effect=fake_download):
-            # Patch image processing sync blocking method to avoid complex pillow mock
-            # since we're just testing the orchestration
-            with patch.object(self.downloader, "_process_image_sync", return_value=("OCR_RES", "/mock/path/final_yt.jpg")):
-                result = await self.downloader.download_media(
-                    "DY_OK_001",
-                    "http://fake/vid.mp4",
-                    "http://fake/cover.webp",
-                )
+        from modules.config_manager import config as _cfg
+
+        def _get_with_custom_cover_mode(key, default=None):
+            if key == "youtube_use_first_frame_cover":
+                return False
+            return _cfg.get(key, default)
+
+        with patch("modules.downloader.config.get", new=_get_with_custom_cover_mode):
+            with patch.object(self.downloader, "_download_file", new_callable=AsyncMock, side_effect=fake_download):
+                with patch.object(
+                    self.downloader, "_process_image_sync", return_value=("OCR_RES", "/mock/path/final_yt.jpg")
+                ):
+                    result = await self.downloader.download_media(
+                        "DY_OK_001",
+                        "http://fake/vid.mp4",
+                        "http://fake/cover.webp",
+                    )
                 
         assert result is not None
         assert "local_video_path" in result

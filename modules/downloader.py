@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import asyncio
 from pathlib import Path
@@ -12,13 +11,9 @@ from PIL import Image
 from modules.logger import logger
 from modules.abogus import USERAGENT
 from modules.config_manager import config
+from utils.paths import data_root
 
-if getattr(sys, 'frozen', False):
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
+DOWNLOAD_DIR = data_root() / "downloads"
 
 class Downloader:
     def __init__(self):
@@ -52,7 +47,15 @@ class Downloader:
                 
             # Task 2: Cover Art Payload
             ocr_text = ""
-            if cover_url and await self._download_file(cover_url, cover_path_webp):
+            # If you want YouTube to use the default thumbnail (often close to first frame),
+            # disable custom cover generation and thumbnail upload.
+            use_first_frame = config.get("youtube_use_first_frame_cover", True)
+            if isinstance(use_first_frame, str):
+                use_first_frame = use_first_frame.strip().lower() not in ("0", "false", "no", "off")
+
+            if use_first_frame:
+                cover_path_jpg = ""
+            elif cover_url and await self._download_file(cover_url, cover_path_webp):
                 # Transformation hook
                 try:
                     ocr_text, final_cover_jpg = await asyncio.to_thread(
@@ -104,10 +107,11 @@ class Downloader:
             logger.warning("Downloader: Windows OCR Module failed or missing: %s", ocr_e)
             
         # --- YouTube 16:9 Thumbnail Generation using Template ---
+        dr = data_root()
         og_template_path = None
         candidates = [
-            PROJECT_ROOT / "og.jpg",
-            PROJECT_ROOT.parent / "og.jpg",
+            dr / "og.jpg",
+            dr.parent / "og.jpg",
         ]
         for c in candidates:
             if c.exists():

@@ -1,15 +1,11 @@
-import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
 from pathlib import Path
 
-if getattr(sys, 'frozen', False):
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from utils.paths import data_root
 
-DB_FILE = PROJECT_ROOT / "douyinsync.db"
+DB_FILE = data_root() / "douyinsync.db"
 
 class StatsDashboard:
     def __init__(self, root):
