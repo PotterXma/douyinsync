@@ -157,6 +157,10 @@ def _is_loop_shutdown_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_invalid_grant_error(exc: BaseException) -> bool:
+    return "invalid_grant" in str(exc).lower()
+
+
 class YoutubeUploader:
     SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 
@@ -170,6 +174,52 @@ class YoutubeUploader:
             self.token = None
         self._hydrate_token_from_storage()
 
+    def _purge_token_file(self) -> None:
+        if not self.token_file.is_file():
+            return
+        try:
+            self.token_file.unlink()
+            logger.info("YoutubeUploader: removed stale token file %s", self.token_file)
+        except OSError as e:
+            logger.error("YoutubeUploader: failed to remove token file %s: %s", self.token_file, e)
+
+    def _refresh_credentials_with_retry(self, creds: Credentials, *, attempts: int = 3) -> bool:
+        """Refresh OAuth credentials; purge token file on invalid_grant; retry transient network errors."""
+        delay = 1.0
+        for attempt in range(1, attempts + 1):
+            try:
+                creds.refresh(GoogleRequest())
+                return True
+            except Exception as e:
+                if _is_invalid_grant_error(e):
+                    logger.warning(
+                        "YoutubeUploader: refresh token revoked (invalid_grant); purging %s",
+                        self.token_file,
+                    )
+                    self._purge_token_file()
+                    return False
+                if attempt < attempts:
+                    logger.warning(
+                        "YoutubeUploader: token refresh failed (attempt %s/%s): %s",
+                        attempt,
+                        attempts,
+                        e,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 8.0)
+                else:
+                    logger.warning(
+                        "YoutubeUploader: token refresh failed after %s attempts: %s",
+                        attempts,
+                        e,
+                    )
+        return False
+
+    def _persist_credentials(self, creds: Credentials) -> None:
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.token_file, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+
     def _hydrate_token_from_storage(self) -> None:
         """If ``youtube_api_token`` was not passed in config, load (and optionally refresh) ``youtube_token.json``."""
         if self.token:
@@ -180,15 +230,16 @@ class YoutubeUploader:
             creds = Credentials.from_authorized_user_file(str(self.token_file), self.SCOPES)
         except Exception as e:
             logger.warning("YoutubeUploader: cannot read token file %s: %s", self.token_file, e)
+            if _is_invalid_grant_error(e):
+                self._purge_token_file()
             return
         try:
             if not creds.valid:
                 if creds.expired and creds.refresh_token:
                     logger.info("YoutubeUploader: refreshing expired token from %s", self.token_file)
-                    creds.refresh(GoogleRequest())
-                    self.token_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(self.token_file, "w", encoding="utf-8") as f:
-                        f.write(creds.to_json())
+                    if not self._refresh_credentials_with_retry(creds):
+                        return
+                    self._persist_credentials(creds)
                 else:
                     logger.warning(
                         "YoutubeUploader: %s exists but credentials are not valid; run OAuth flow (authenticate).",
@@ -199,39 +250,61 @@ class YoutubeUploader:
             logger.info("YoutubeUploader: loaded access token from %s", self.token_file)
         except Exception as e:
             logger.warning("YoutubeUploader: token refresh failed: %s", e)
+            if _is_invalid_grant_error(e):
+                self._purge_token_file()
 
-    def authenticate(self) -> bool:
-        """Boots the OAuth 2.0 flow securely or retrieves via cached refresh tokens."""
+    def authenticate(self, *, interactive: bool = True) -> bool:
+        """Boot OAuth 2.0 flow or refresh cached tokens.
+
+        When ``interactive`` is False (scheduled background runs), never opens a browser;
+        returns False if interactive re-authorization would be required.
+        """
         creds = None
-        
+
         if self.token_file.exists():
             try:
                 creds = Credentials.from_authorized_user_file(str(self.token_file), self.SCOPES)
             except Exception as e:
-                logger.warning("Failed to parse cached token: %s", e)
-                
+                logger.warning("YoutubeUploader: failed to parse cached token: %s", e)
+                if _is_invalid_grant_error(e):
+                    self._purge_token_file()
+
         if not creds or not creds.valid:
             try:
                 if creds and creds.expired and creds.refresh_token:
-                    logger.info("Token expired, requesting refresh...")
-                    creds.refresh(GoogleRequest())
-                else:
+                    logger.info("YoutubeUploader: token expired, attempting refresh...")
+                    if self._refresh_credentials_with_retry(creds):
+                        self._persist_credentials(creds)
+                    else:
+                        creds = None
+
+                if not creds or not creds.valid:
                     if not self.client_secrets_file.exists():
-                        logger.error("Missing %s.", self.client_secrets_file)
+                        logger.error(
+                            "YoutubeUploader: missing client secrets file: %s",
+                            self.client_secrets_file,
+                        )
                         return False
-                    
+                    if not interactive:
+                        logger.error(
+                            "YoutubeUploader: YouTube OAuth re-authorization required but "
+                            "interactive flow is disabled (scheduled run). Use tray "
+                            "'Run sync now' or delete youtube_token.json and restart."
+                        )
+                        return False
+                    logger.info("YoutubeUploader: starting interactive OAuth flow...")
                     flow = InstalledAppFlow.from_client_secrets_file(
                         str(self.client_secrets_file), self.SCOPES
                     )
                     creds = flow.run_local_server(port=0, open_browser=True)
-                    
-                self.token_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.token_file, 'w') as token_cache:
-                    token_cache.write(creds.to_json())
+
+                self._persist_credentials(creds)
             except Exception as e:
-                logger.error("Authentication failure: %s", e)
+                logger.error("YoutubeUploader: authentication failure: %s", e)
+                if _is_invalid_grant_error(e):
+                    self._purge_token_file()
                 return False
-                
+
         self.token = creds.token
         return True
 

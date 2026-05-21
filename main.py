@@ -109,10 +109,12 @@ def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator
                 coordinator.apply_primary_schedule()
         if _consume_manual_force_retry_request_file():
             logger.info("Manual sync: force-retry request (normalize give_up/failed; bypass per-attempt caps).")
-            coordinator.primary_sync_job(force_retry_bypass=True)
+            coordinator.primary_sync_job(
+                force_retry_bypass=True, allow_interactive_oauth=True
+            )
         elif _consume_manual_sync_request_file():
             logger.info("Manual sync: request file from Dashboard (or external touch).")
-            coordinator.primary_sync_job()
+            coordinator.primary_sync_job(allow_interactive_oauth=True)
         try:
             event = event_queue.get(timeout=1.0)
             if event.command == "EXIT":
@@ -124,7 +126,7 @@ def background_daemon(event_queue: queue.Queue, coordinator: PipelineCoordinator
                     coordinator.apply_primary_schedule()
             elif event.command == "RUN_PIPELINE_NOW":
                 logger.info("Manual sync: tray command RUN_PIPELINE_NOW.")
-                coordinator.primary_sync_job()
+                coordinator.primary_sync_job(allow_interactive_oauth=True)
             elif event.command == "OPEN_DASHBOARD":
                 logger.info("Open dashboard command received.")
                 try:

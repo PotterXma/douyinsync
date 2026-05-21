@@ -239,3 +239,44 @@ class TestMidnightRolloverRaceCondition:
             with patch('modules.notifier.requests.get') as mock_get:
                 notifier.push_daily_summary()
                 mock_get.assert_not_called()
+
+
+class TestBarkNotificationId:
+    """Distinct Bark id per download retry so the client does not merge banners."""
+
+    def test_push_appends_notification_id_query(self):
+        with patch('modules.notifier.config') as mock_config:
+            def cfg(key, default=None):
+                if key == 'bark_server':
+                    return 'https://api.day.app'
+                if key == 'bark_key':
+                    return 'TESTKEY'
+                if key == 'bark_sound':
+                    return 'minuet'
+                return default
+
+            mock_config.get.side_effect = cfg
+            from modules.notifier import BarkNotifier
+
+            notifier = BarkNotifier()
+            with patch('modules.notifier.requests.get') as mock_get:
+                mock_get.return_value = MagicMock(status_code=200)
+                notifier.push(
+                    "DouyinSync 下载未成功 (1/3)",
+                    "body",
+                    notification_id="dl-123-r1",
+                )
+                call_url = mock_get.call_args[0][0]
+                assert "id=dl-123-r1" in call_url
+
+
+def test_download_failure_bark_titles_are_unique_per_retry():
+    from modules.scheduler import _download_failure_bark_title
+
+    t1 = _download_failure_bark_title(1, give_up=False)
+    t2 = _download_failure_bark_title(2, give_up=False)
+    t3 = _download_failure_bark_title(3, give_up=True)
+    assert t1 != t2
+    assert t2 != t3
+    assert "(1/3)" in t1
+    assert "(3/3)" in t3

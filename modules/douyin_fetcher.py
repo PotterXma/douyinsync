@@ -192,13 +192,23 @@ class DouyinFetcher:
         logger.info("DouyinFetcher: Successfully processed %s valid video records.", len(results))
         return results
 
-    async def refresh_video_url(self, douyin_id: str, accounts: list) -> Optional[dict]:
+    async def refresh_video_url(
+        self, douyin_id: str, accounts: list, *, max_pages: int | None = None
+    ) -> Optional[dict]:
         """
         Re-fetches the video list from the API and finds a matching video_id 
         to obtain a fresh CDN URL with valid time-based tokens.
-        Searches up to 3 pages to handle accounts with many videos.
+        Searches up to ``max_pages`` feed pages (defaults to ``max_scroll_pages`` in config).
         Returns dict with fresh video_url/cover_url or None if not found.
         """
+        if max_pages is None:
+            try:
+                max_pages = max(1, int(config.get("max_scroll_pages", 5)))
+            except (TypeError, ValueError):
+                max_pages = 5
+        else:
+            max_pages = max(1, int(max_pages))
+
         for account in accounts:
             if isinstance(account, dict):
                 if not account.get("enable", True):
@@ -211,9 +221,8 @@ class DouyinFetcher:
                 continue
             
             try:
-                # Search up to 3 pages to find the video (may not be in the first 10/13 results)
                 cursor = 0
-                for _page in range(3):
+                for _page in range(max_pages):
                     posts, next_cursor, has_more = await self.fetch_user_posts(account_url, max_cursor=cursor)
                     for post in posts:
                         if post.douyin_id == douyin_id:

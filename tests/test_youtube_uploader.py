@@ -378,3 +378,53 @@ def test_retry_after_sleep_seconds():
     r2 = MagicMock()
     r2.headers = {}
     assert _retry_after_sleep_seconds(r2, 8.0) == 8.0
+
+
+def test_authenticate_self_healing_refresh_failure(tmp_path):
+    """When refresh fails with invalid_grant, purge stale youtube_token.json and return False."""
+    from google.oauth2.credentials import Credentials
+    from modules.youtube_uploader import YoutubeUploader
+
+    # 创建模拟的本地令牌缓存文件
+    token_file = tmp_path / "youtube_token.json"
+    token_file.write_text('{"token": "old_token", "refresh_token": "refresh_me"}', encoding="utf-8")
+
+    # 模拟 client_secrets_file 不存在
+    client_secrets_file = tmp_path / "client_secret.json"
+
+    # 模拟从文件中成功加载但已失效 of creds
+    mock_creds = MagicMock(spec=Credentials)
+    mock_creds.valid = False
+    mock_creds.expired = True
+    mock_creds.refresh_token = "refresh_me"
+
+    # 让 refresh() 抛出异常，模拟 AD 安全凭证已在服务端过期或被撤销
+    mock_creds.refresh.side_effect = Exception("invalid_grant: Token has been expired or revoked.")
+
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=mock_creds):
+        uploader = YoutubeUploader(
+            client_secrets_file=str(client_secrets_file),
+            token_file=str(token_file)
+        )
+        # 执行身份校验
+        res = uploader.authenticate(interactive=False)
+
+        assert res is False
+        assert not token_file.exists()
+
+
+def test_authenticate_non_interactive_skips_browser(tmp_path):
+    """Scheduled runs must not open OAuth browser when token file is missing."""
+    from modules.youtube_uploader import YoutubeUploader
+
+    client_secrets = tmp_path / "client_secret.json"
+    client_secrets.write_text("{}", encoding="utf-8")
+    uploader = YoutubeUploader(
+        client_secrets_file=str(client_secrets),
+        token_file=str(tmp_path / "missing_token.json"),
+    )
+    with patch(
+        "modules.youtube_uploader.InstalledAppFlow.from_client_secrets_file"
+    ) as mock_flow:
+        assert uploader.authenticate(interactive=False) is False
+        mock_flow.assert_not_called()

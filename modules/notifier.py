@@ -33,13 +33,22 @@ class BarkNotifier:
             return bark_url
         return ""
 
-    def push(self, title: str, message: str, level: str = "active"):
+    def push(
+        self,
+        title: str,
+        message: str,
+        level: str = "active",
+        *,
+        notification_id: str | None = None,
+    ):
         """
         推送至 Bark；URL 带 config 的 ``bark_sound``，一般为有声铃音。
 
         * ``active``：默认、普通通知+铃声
         * ``timeSensitive``：时间敏感/更高打扰（仍带 sound，非 silent）
         * ``passive``：静默、仅进列表（如每日 23:50 汇总，避免刷爆）
+        * ``notification_id``：Bark ``id`` 参数；每次重试应使用不同 id，避免客户端合并为一条
+
         每次从 config 读入，支持热重载。
         """
         bark_url = self._get_bark_url()
@@ -54,6 +63,8 @@ class BarkNotifier:
             # API Pattern: https://api.day.app/key/title/content
             sound = str(config.get("bark_sound", "minuet")).strip()
             dispatch_url = f"{bark_url}/{safe_title}/{safe_msg}?level={level}&sound={sound}"
+            if notification_id:
+                dispatch_url += f"&id={quote(str(notification_id), safe='')}"
             
             # 15 second timeout to prevent blocking thread execution
             resp = requests.get(dispatch_url, timeout=15.0)

@@ -180,7 +180,7 @@ class VideoDAO:
     @staticmethod
     def get_pending_videos(limit: int = 5) -> list[VideoRecord]:
         """Retrieves outstanding elements marked as 'pending' mapping them back to VideoRecord."""
-        sql = "SELECT * FROM videos WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?"
+        sql = "SELECT * FROM videos WHERE status = 'pending' ORDER BY created_at DESC LIMIT ?"
         results = []
         with db.get_connection() as conn:
             cursor = conn.cursor()

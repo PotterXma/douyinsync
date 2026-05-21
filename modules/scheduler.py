@@ -100,6 +100,15 @@ def _quota_revert_downloaded() -> dict:
     return {"upload_bytes_done": 0, "upload_bytes_total": None}
 
 
+def _download_failure_bark_title(retry: int, *, give_up: bool, exception: bool = False) -> str:
+    """Distinct title per attempt so iOS/Bark do not collapse retries 1 and 2 into one banner."""
+    if give_up:
+        return f"DouyinSync 下载放弃 ({retry}/3)"
+    if exception:
+        return f"DouyinSync 下载异常 ({retry}/3)"
+    return f"DouyinSync 下载未成功 ({retry}/3)"
+
+
 def _normalize_schedule_mode(raw: object) -> str:
     m = str(raw or "interval").lower().strip()
     if m in ("clock", "cron", "fixed_times", "fixed", "time", "daily"):
@@ -161,7 +170,12 @@ class PipelineCoordinator:
         if reverted > 0:
             logger.warning("PipelineCoordinator: Successfully rescued %s stranded zombie tasks from previous unexpected halt.", reverted)
 
-    def primary_sync_job(self, force_retry_bypass: bool = False):
+    def primary_sync_job(
+        self,
+        force_retry_bypass: bool = False,
+        *,
+        allow_interactive_oauth: bool = False,
+    ):
         """The master scheduled task bridging and governing all Epics."""
         if not self._pipeline_lock.acquire(blocking=False):
             logger.warning("PipelineCoordinator: Pipeline already running. Skipping duplicate invocation.")
@@ -170,13 +184,139 @@ class PipelineCoordinator:
         self._primary_pipeline_active = True
         write_hud_state_file(self)
         try:
-            asyncio.run(self._run_async_cycle(force_retry_bypass))
+            asyncio.run(
+                self._run_async_cycle(
+                    force_retry_bypass,
+                    allow_interactive_oauth=allow_interactive_oauth,
+                )
+            )
         finally:
             self._primary_pipeline_active = False
             self._pipeline_lock.release()
             write_hud_state_file(self)
 
-    async def _run_async_cycle(self, force_retry_bypass: bool = False):
+    async def _ensure_youtube_ready(
+        self, uploader: YoutubeUploader, *, allow_interactive_oauth: bool
+    ) -> bool:
+        """Return True when upload credentials are available; notify on scheduled-auth failure."""
+        if uploader.token and str(uploader.token).strip():
+            return True
+        try:
+            ok = await asyncio.to_thread(
+                uploader.authenticate, interactive=allow_interactive_oauth
+            )
+        except Exception as e:
+            ok = False
+            logger.error("PipelineCoordinator: YouTube OAuth flow failed: %s", e)
+        if ok and uploader.token and str(uploader.token).strip():
+            return True
+        client_secret = str(
+            config.get("youtube_client_secret_file", "client_secret.json")
+            or "client_secret.json"
+        )
+        logger.error(
+            "PipelineCoordinator: YouTube OAuth unavailable; skipping uploads this cycle. "
+            "Ensure %s exists and re-authorize (tray「手动执行一次」或删除 youtube_token.json 后重启).",
+            client_secret,
+        )
+        try:
+            await asyncio.to_thread(
+                self.notifier.push,
+                "DouyinSync: YouTube 授权失效",
+                "定时任务已触发，但 YouTube 令牌无效或已撤销。"
+                "请托盘「手动执行一次」完成浏览器授权，或删除 youtube_token.json 后重启主程序。",
+                level="timeSensitive",
+            )
+        except Exception:
+            pass
+        return False
+
+    async def _resolve_media_urls(
+        self,
+        dy_id: str,
+        video_url: str,
+        cover_url: str,
+        accounts: list,
+    ) -> tuple[str, str, bool]:
+        """Refresh CDN URLs before download; returns (video_url, cover_url, refreshed_ok)."""
+        try:
+            max_pages = max(1, int(config.get("max_scroll_pages", 5)))
+        except (TypeError, ValueError):
+            max_pages = 5
+
+        fresh = await self.fetcher.refresh_video_url(
+            dy_id, accounts, max_pages=max_pages
+        )
+        if not fresh:
+            fresh = await self.fetcher.refresh_video_url(
+                dy_id, accounts, max_pages=max(max_pages, 10)
+            )
+            if fresh:
+                logger.info(
+                    "PipelineCoordinator: Resolved fresh CDN URLs for [%s] after extended feed scan.",
+                    dy_id,
+                )
+        if fresh:
+            vu = fresh.get("video_url", video_url) or video_url
+            cu = fresh.get("cover_url", cover_url) or cover_url
+            VideoDAO.update_fresh_urls(dy_id, vu, cu)
+            return vu, cu, True
+
+        logger.warning(
+            "PipelineCoordinator: Could not find [%s] in recent feed pages; using cached CDN URL (may 403 if stale).",
+            dy_id,
+        )
+        return video_url, cover_url, False
+
+    async def _notify_download_outcome(
+        self,
+        video,
+        retry: int,
+        *,
+        give_up: bool,
+        exception: bool = False,
+        err_summary: str = "",
+    ) -> None:
+        """One Bark per failed download attempt (unique title + notification id)."""
+        dy_id = getattr(video, "douyin_id", "") or ""
+        title = _download_failure_bark_title(retry, give_up=give_up, exception=exception)
+        cap = _bark_video_caption(video)
+        if give_up:
+            body = (
+                f"{cap}\n已重试 {retry} 次仍失败（常见：CDN 链接过期 403）。"
+                "任务已放弃，可在看板强制重试或删除该条。"
+            )
+            if err_summary:
+                body += f"\n{_bark_snip(err_summary, 120)}"
+            level = "timeSensitive"
+        elif exception:
+            body = f"{cap}\n将自动重试 {retry}/3。"
+            if err_summary:
+                body += f"\n{_bark_snip(err_summary, 150)}"
+            level = _BARK_ERR
+        else:
+            body = f"{cap}\n无媒体或链接失效，将自动重试 {retry}/3。"
+            level = _BARK_ERR
+        notif_id = f"dl-{dy_id}-r{retry}"
+        try:
+            await asyncio.to_thread(
+                self.notifier.push,
+                title,
+                body,
+                level,
+                notification_id=notif_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "PipelineCoordinator: Bark push failed for download outcome [%s] retry=%s: %s",
+                dy_id,
+                retry,
+                e,
+            )
+
+    async def _run_async_cycle(
+        self, force_retry_bypass: bool = False, *, allow_interactive_oauth: bool = False
+    ):
         """Internal sync cycle, executed asynchronously."""
         logger.info("PipelineCoordinator: === Initiating Scheduled Primary Sync Cycle ===")
         if force_retry_bypass:
@@ -221,24 +361,8 @@ class PipelineCoordinator:
             token_file=token_file,
         )
 
-        # Auto OAuth bootstrap: if no access token provided and no cached youtube_token.json,
-        # trigger one-time OAuth flow to generate/refresh youtube_token.json.
-        # This avoids requiring a dedicated tray/menu "Authorize" entry.
-        if not uploader.token or not str(uploader.token).strip():
-            try:
-                ok = await asyncio.to_thread(uploader.authenticate)
-            except Exception as e:
-                ok = False
-                logger.error("PipelineCoordinator: YouTube OAuth flow failed: %s", e)
-            if not ok or not uploader.token or not str(uploader.token).strip():
-                logger.error(
-                    "PipelineCoordinator: YouTube OAuth token missing. Ensure %s exists and complete browser authorization.",
-                    client_secret,
-                )
-                return
-
         try:
-            # Phase 1. Fetcher Subroutine
+            # Phase 1. Fetcher Subroutine (runs even when YouTube OAuth is unavailable)
             douyin_accounts = config.get("douyin_accounts", [])
             for account in douyin_accounts:
                 if isinstance(account, dict):
@@ -282,6 +406,18 @@ class PipelineCoordinator:
                     max_cursor = next_cursor
 
             # Phase 3. Downloader & Uploader Sync
+            youtube_ready = (
+                not is_youtube_blocked
+                and await self._ensure_youtube_ready(
+                    uploader, allow_interactive_oauth=allow_interactive_oauth
+                )
+            )
+            if not youtube_ready:
+                logger.warning(
+                    "PipelineCoordinator: Upload phases skipped until YouTube OAuth is restored; "
+                    "download will still run for pending queue."
+                )
+
             daily_limit = config.get("daily_upload_limit", 1)
             uploaded_today = VideoDAO.get_uploaded_today_count()
             
@@ -294,10 +430,14 @@ class PipelineCoordinator:
                 )
             else:
                 max_per_cycle = config.get("max_videos_per_run", 1)
+                try:
+                    max_per_cycle = max(1, int(max_per_cycle))
+                except (TypeError, ValueError):
+                    max_per_cycle = 1
                 slots_left = min(daily_limit - uploaded_today, max_per_cycle)
                 
-                # Phase 3-Pre: Re-upload videos
-                if not is_youtube_blocked:
+                # Phase 3-Pre: Re-upload videos (requires YouTube OAuth)
+                if youtube_ready and not is_youtube_blocked:
                     uploadable = VideoDAO.get_uploadable_videos(
                         limit=slots_left, ignore_retry_cap=force_retry_bypass
                     )
@@ -405,42 +545,50 @@ class PipelineCoordinator:
                                 e,
                             )
                 
-                # Phase 3-Main: Download + Upload new
-                if slots_left > 0:
-                    pending_videos = VideoDAO.get_pending_videos(limit=slots_left)
-                else:
-                    pending_videos = []
+                # Phase 3-Main: Download new pending (does not require YouTube OAuth)
+                pending_videos = VideoDAO.get_pending_videos(limit=max_per_cycle)
                 
                 for video in pending_videos:
                     dy_id = video.douyin_id
                     VideoDAO.update_status(dy_id, 'processing')
                     
-                    video_url = video.video_url
-                    cover_url = video.cover_url
+                    _refreshed = False
                     try:
-                        fresh = await self.fetcher.refresh_video_url(dy_id, douyin_accounts)
-                        if fresh:
-                            video_url = fresh.get('video_url', video_url)
-                            cover_url = fresh.get('cover_url', cover_url)
-                            VideoDAO.update_fresh_urls(dy_id, video_url, cover_url)
+                        video_url, cover_url, _refreshed = await self._resolve_media_urls(
+                            dy_id, video.video_url, video.cover_url, douyin_accounts
+                        )
                     except Exception as e:
                         logger.warning("PipelineCoordinator: URL refresh failed for [%s]: %s", dy_id, e)
+                        video_url = video.video_url
+                        cover_url = video.cover_url
                     
                     try:
                         paths = await self.downloader.download_media(dy_id, video_url, cover_url)
+                        if not paths and not _refreshed:
+                            try:
+                                video_url, cover_url, _ = await self._resolve_media_urls(
+                                    dy_id, video.video_url, video.cover_url, douyin_accounts
+                                )
+                                paths = await self.downloader.download_media(
+                                    dy_id, video_url, cover_url
+                                )
+                            except Exception as e2:
+                                logger.warning(
+                                    "PipelineCoordinator: Retry download after URL refresh failed for [%s]: %s",
+                                    dy_id,
+                                    e2,
+                                )
                         if not paths:
                             retry = video.retry_count + 1
-                            if retry >= 3 and not force_retry_bypass:
+                            give_up = retry >= 3 and not force_retry_bypass
+                            if give_up:
                                 VideoDAO.update_status(
                                     dy_id,
                                     "give_up",
                                     {"retry_count": retry, "local_video_path": None, "local_cover_path": None},
                                 )
-                                await asyncio.to_thread(
-                                    self.notifier.push,
-                                    "DouyinSync: Download Give Up",
-                                    "Video [%s] failed to download after 3 attempts." % dy_id,
-                                    level="timeSensitive",
+                                await self._notify_download_outcome(
+                                    video, retry, give_up=True
                                 )
                                 logger.error(
                                     "PipelineCoordinator: Download give_up [%s] after 3 failed attempts (empty result).",
@@ -456,11 +604,8 @@ class PipelineCoordinator:
                                         "local_cover_path": None,
                                     },
                                 )
-                                await asyncio.to_thread(
-                                    self.notifier.push,
-                                    "DouyinSync 下载未成功",
-                                    f"{_bark_video_caption(video)}\n无媒体，将重试 {retry}/3。",
-                                    _BARK_ERR,
+                                await self._notify_download_outcome(
+                                    video, retry, give_up=False
                                 )
                                 logger.warning(
                                     "PipelineCoordinator: Download failed for [%s]; queued retry %s%s.",
@@ -472,17 +617,20 @@ class PipelineCoordinator:
                     except Exception as e:
                         logger.error("PipelineCoordinator: Downloader Exception for [%s]: %s", dy_id, e)
                         retry = video.retry_count + 1
-                        if retry >= 3 and not force_retry_bypass:
+                        give_up = retry >= 3 and not force_retry_bypass
+                        err_sum = _upload_error_summary(e)
+                        if give_up:
                             VideoDAO.update_status(
                                 dy_id,
                                 "give_up",
                                 {"retry_count": retry, "local_video_path": None, "local_cover_path": None},
                             )
-                            await asyncio.to_thread(
-                                self.notifier.push,
-                                "DouyinSync: Download Give Up",
-                                "Video [%s] raised after 3 attempts: %s" % (dy_id, e),
-                                level="timeSensitive",
+                            await self._notify_download_outcome(
+                                video,
+                                retry,
+                                give_up=True,
+                                exception=True,
+                                err_summary=err_sum,
                             )
                             logger.error(
                                 "PipelineCoordinator: Download give_up [%s] after 3 exceptions: %s",
@@ -499,11 +647,12 @@ class PipelineCoordinator:
                                     "local_cover_path": None,
                                 },
                             )
-                            await asyncio.to_thread(
-                                self.notifier.push,
-                                "DouyinSync 下载异常",
-                                f"{_bark_video_caption(video)}\n重试 {retry}/3\n{_bark_snip(str(e), 150)}",
-                                _BARK_ERR,
+                            await self._notify_download_outcome(
+                                video,
+                                retry,
+                                give_up=False,
+                                exception=True,
+                                err_summary=err_sum,
                             )
                             logger.warning(
                                 "PipelineCoordinator: Download exception [%s]; queued retry %s → pending. Error: %s",
@@ -530,8 +679,13 @@ class PipelineCoordinator:
                         _BARK_OK,
                     )
 
-                    if is_youtube_blocked:
-                         continue
+                    if is_youtube_blocked or not youtube_ready:
+                        if not youtube_ready:
+                            logger.info(
+                                "PipelineCoordinator: Download OK for [%s]; upload deferred (YouTube OAuth not ready).",
+                                dy_id,
+                            )
+                        continue
                          
                     _begin_upload_tracking(dy_id, video.local_video_path)
                     
@@ -692,6 +846,7 @@ class PipelineCoordinator:
                 IntervalTrigger(minutes=interval),
                 id="primary_sync",
                 max_instances=1,
+                replace_existing=True,
             )
             logger.info(
                 "PipelineCoordinator: Primary sync schedule = interval every %s minute(s).",
@@ -705,6 +860,7 @@ class PipelineCoordinator:
                 CronTrigger(hour=h, minute=m),
                 id=jid,
                 max_instances=1,
+                replace_existing=True,
             )
         logger.info("PipelineCoordinator: Primary sync schedule = clock at local times %s.", times)
 

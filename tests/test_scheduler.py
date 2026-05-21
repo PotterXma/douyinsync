@@ -417,3 +417,49 @@ async def test_first_upload_empty_youtube_id_marks_failed(mock_dependencies):
             "last_error_summary": "Empty YouTube video id",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_oauth_failure_still_runs_fetcher_and_download(mock_dependencies):
+    """Scheduled cycles must fetch and download even when YouTube OAuth is unavailable."""
+    coordinator = PipelineCoordinator()
+    coordinator.sweeper.check_preflight_space = MagicMock(return_value=True)
+
+    mock_video = MagicMock(spec=VideoRecord)
+    mock_video.douyin_id = "dy_new_1"
+    mock_video.video_url = "https://cdn.example/v.mp4"
+    mock_video.cover_url = "https://cdn.example/c.jpg"
+    mock_video.retry_count = 0
+    mock_video.title = ""
+    mock_video.account_mark = ""
+
+    mock_dependencies["config"].get.side_effect = lambda k, default=None: {
+        "douyin_accounts": [{"url": "https://example.com/user/x", "mark": "acc", "enable": True}],
+        "daily_upload_limit": 10,
+        "max_videos_per_run": 1,
+        "max_scroll_pages": 5,
+        "youtube_api_token": "",
+        "youtube_client_secret_file": "client_secret.json",
+        "sync_schedule_mode": "interval",
+        "sync_interval_minutes": 60,
+    }.get(k, default)
+    mock_dependencies["dao"].get_pending_videos.return_value = [mock_video]
+    mock_dependencies["dao"].get_uploadable_videos.return_value = []
+    mock_dependencies["dao"].get_uploaded_today_count.return_value = 0
+    mock_dependencies["fetcher"].return_value.refresh_video_url = AsyncMock(
+        return_value={"video_url": "https://fresh/v.mp4", "cover_url": "https://fresh/c.jpg"}
+    )
+    mock_dependencies["downloader"].return_value.download_media = AsyncMock(
+        return_value={"local_video_path": "/mock/v.mp4", "local_cover_path": "/mock/c.jpg", "ocr_text": ""}
+    )
+
+    inst = mock_dependencies["uploader"].return_value
+    inst.token = None
+    inst.authenticate.return_value = False
+
+    await coordinator._run_async_cycle(allow_interactive_oauth=False)
+
+    inst.authenticate.assert_called_once_with(interactive=False)
+    mock_dependencies["fetcher"].return_value.fetch_user_posts.assert_called()
+    mock_dependencies["downloader"].return_value.download_media.assert_called()
+    inst.upload.assert_not_called()

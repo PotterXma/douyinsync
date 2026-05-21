@@ -108,7 +108,12 @@ class TrayController:
         logger.info("Tray Menu UI: Manually running pipeline (in-process)")
         if self.coordinator:
             import threading
-            t = threading.Thread(target=self.coordinator.primary_sync_job, daemon=True)
+            t = threading.Thread(
+                target=lambda: self.coordinator.primary_sync_job(
+                    allow_interactive_oauth=True
+                ),
+                daemon=True,
+            )
             t.start()
         else:
             logger.error("Tray Menu UI: No coordinator reference available for manual run.")
